@@ -29,7 +29,7 @@
 
 ## 使用方法
 
-1. 下载脚本
+### 下载脚本
    ```bash
    wget https://github.com/xpnas/openvpn-manager/blob/master/openvpn-manager.sh -O openvpn-manager.sh
-   # 或手动上传 / 复制粘贴
+### 手动上传 / 复制粘贴
