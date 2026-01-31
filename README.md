@@ -31,5 +31,6 @@
 
 ### 下载脚本
    ```bash
-   wget https://github.com/xpnas/openvpn-manager/blob/master/openvpn-manager.sh -O openvpn-manager.sh
-### 手动上传 / 复制粘贴
+   wget -O openvpn-manager.sh https://raw.githubusercontent.com/xpnas/openvpn-manager/master/openvpn-manager.sh && chmod +x openvpn-manager.sh && ./openvpn-manager.sh
+   ```
+
