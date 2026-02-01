@@ -1,14 +1,54 @@
 #!/bin/sh
-# Alpine OpenVPN TCP 管理脚本（最终完整版 2026）
-# 功能：apk源切换 → 安装服务端 → 添加客户端 → 端口放行 → 特定客户端配置 → 全局自定义 → 卸载 → 删除客户端
-# 配置文件统一使用 /etc/openvpn/openvpn.conf（Alpine默认路径）
-# 默认绕过列表只定义一次，所有模式共用
-# 主菜单循环（0退出），添加客户端后可直接配置
-# POSIX兼容（无mapfile），兼容ash shell
+# OpenVPN TCP 管理脚本 - 兼容 Alpine & Debian/Ubuntu (单文件完整版)
+# 功能：安装服务端 / 添加客户端 / 端口放行 / 特定客户端配置 / 全局配置 / 卸载 / 删除客户端
+# 自动检测系统类型并适配
+# POSIX 兼容写法，适用于 ash / bash
 
 set -e
 
-# 默认的中国 IP 绕过列表（38条 /8 段，只定义一次）
+# ─────────────────────────────────────────────────────────────
+# 检测系统类型并设置变量
+# ─────────────────────────────────────────────────────────────
+if [ -f /etc/alpine-release ]; then
+    OS="alpine"
+    PKG_INSTALL="apk add --no-cache"
+    PKG_REMOVE="apk del --purge"
+    PKG_UPDATE="apk update"
+    SERVICE_START="rc-service openvpn start"
+    SERVICE_STOP="rc-service openvpn stop"
+    SERVICE_RESTART="rc-service openvpn restart"
+    SERVICE_ENABLE="rc-update add openvpn default"
+    SERVICE_DISABLE="rc-update del openvpn default"
+    CONFIG_FILE="/etc/openvpn/openvpn.conf"
+    PERSIST_FILE="/etc/local.d/openvpn-nat.start"
+    EASY_RSA_DIR="/etc/openvpn/easy-rsa"
+    USE_SYSTEMD=0
+elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
+    OS="debian"
+    PKG_INSTALL="apt update && apt install -y"
+    PKG_REMOVE="apt purge -y"
+    PKG_UPDATE="apt update"
+    SERVICE_START="systemctl start openvpn@server"
+    SERVICE_STOP="systemctl stop openvpn@server"
+    SERVICE_RESTART="systemctl restart openvpn@server"
+    SERVICE_ENABLE="systemctl enable openvpn@server"
+    SERVICE_DISABLE="systemctl disable openvpn@server"
+    CONFIG_FILE="/etc/openvpn/server.conf"
+    PERSIST_FILE="/etc/iptables.rules.v4"
+    EASY_RSA_DIR="/etc/openvpn/easy-rsa"
+    USE_SYSTEMD=1
+else
+    echo "不支持的系统！仅支持 Alpine Linux 或 Debian/Ubuntu"
+    exit 1
+fi
+
+echo "检测到系统：$OS"
+echo "配置文件路径：$CONFIG_FILE"
+echo ""
+
+# ─────────────────────────────────────────────────────────────
+# 默认的中国 IP 绕过列表（38条，只定义一次）
+# ─────────────────────────────────────────────────────────────
 DEFAULT_BYPASS_PUSH=$(cat << 'EOD'
 push "route 1.0.0.0 255.0.0.0 net_gateway"
 push "route 14.0.0.0 255.0.0.0 net_gateway"
@@ -52,82 +92,21 @@ push "route 222.0.0.0 255.0.0.0 net_gateway"
 EOD
 )
 
-echo "=== Alpine OpenVPN TCP 管理脚本（最终完整版）==="
-echo "当前时间：$(date '+%Y-%m-%d %H:%M')"
-echo ""
-
-# ─────────────────────────────────────────────────────────────
-# apk 源切换（仅第一次运行时询问）
-# ─────────────────────────────────────────────────────────────
-if [ ! -f /etc/apk/repositories.bak ]; then
-    echo "检测到首次运行，推荐更换 apk 源（清华源有时同步问题）。"
-    echo "推荐使用阿里云镜像（国内高速、稳定）。"
-    echo ""
-    echo "选项："
-    echo "  1) 阿里云 (mirrors.aliyun.com) ← 推荐"
-    echo "  2) 清华 TUNA"
-    echo "  3) 中科大"
-    echo "  4) 官方 CDN"
-    echo "  5) 跳过"
-    read -p "选择（1~5，回车1）： " mirror_choice
-    mirror_choice=${mirror_choice:-1}
-
-    if [ "$mirror_choice" != "5" ]; then
-        cp /etc/apk/repositories /etc/apk/repositories.bak 2>/dev/null || true
-
-        ALPINE_VER=$(cat /etc/alpine-release | cut -d. -f1-2 2>/dev/null || echo "edge")
-        [ "$ALPINE_VER" = "edge" ] && {
-            MAIN_REPO="edge/main"
-            COMM_REPO="edge/community"
-        } || {
-            MAIN_REPO="v${ALPINE_VER}/main"
-            COMM_REPO="v${ALPINE_VER}/community"
-        }
-
-        case $mirror_choice in
-            1) MIRROR="https://mirrors.aliyun.com/alpine" ;;
-            2) MIRROR="https://mirrors.tuna.tsinghua.edu.cn/alpine" ;;
-            3) MIRROR="https://mirrors.ustc.edu.cn/alpine" ;;
-            4) MIRROR="https://dl-cdn.alpinelinux.org/alpine" ;;
-            *) MIRROR="https://mirrors.aliyun.com/alpine" ;;
-        esac
-
-        cat > /etc/apk/repositories << EOF
-${MIRROR}/${MAIN_REPO}
-${MIRROR}/${COMM_REPO}
-EOF
-
-        echo "源已切换为 ${MIRROR}"
-        apk update || {
-            echo "apk update 失败！已恢复备份。"
-            cp /etc/apk/repositories.bak /etc/apk/repositories 2>/dev/null
-        }
-    fi
-fi
-
-# ─────────────────────────────────────────────────────────────
-# 变量定义
-# ─────────────────────────────────────────────────────────────
-EASYRSA_DIR="/etc/openvpn/easy-rsa"
-SERVER_CONF="/etc/openvpn/openvpn.conf"
-CCD_DIR="/etc/openvpn/ccd"
-CLIENT_DIR="/etc/openvpn"
-
 # ─────────────────────────────────────────────────────────────
 # 主菜单循环
 # ─────────────────────────────────────────────────────────────
 while true; do
     clear
 
-    if [ -f "$SERVER_CONF" ]; then
-        echo "服务端已安装。"
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "OpenVPN 服务端已安装。"
         echo "1) 添加新客户端"
         echo "2) 放行/检查 VPN 端口（TCP）"
-        echo "3) 配置特定客户端（LAN + 固定IP + push）"
+        echo "3) 配置特定客户端（LAN访问 + 固定IP + push）"
         echo "4) 全局自定义配置（中国IP绕过、DNS、LAN 等）"
         echo "5) 重新安装/覆盖服务端配置"
         echo "6) 卸载 OpenVPN 和所有配置"
-        echo "7) 删除指定客户端（证书 + ccd + .ovpn）"
+        echo "7) 删除指定客户端"
         echo "0) 退出脚本"
         echo ""
         read -p "请选择操作（0~7，回车默认1）： " mode_choice
@@ -143,26 +122,25 @@ while true; do
     fi
 
     # ─────────────────────────────────────────────────────────────
-    # 模式1：添加新客户端 + 询问是否立即配置该客户端
+    # 模式1：添加新客户端 + 可立即配置
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "1" ]; then
-        if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$SERVER_CONF" ]; then
-            echo "错误：服务端未正确安装。请先选择模式 5。"
-            echo "按回车继续..."
-            read -p ""
+        if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$CONFIG_FILE" ]; then
+            echo "服务端未正确安装，请先选择模式 5。"
+            read -p "按回车继续..."
             continue
         fi
 
         cd "$EASYRSA_DIR"
 
-        PORT=$(grep '^port ' "$SERVER_CONF" | awk '{print $2}' || echo "51820")
-        SERVER_IP=$(curl -s https://api.ipify.org 2>/dev/null || curl -s https://icanhazip.com 2>/dev/null || echo "YOUR_SERVER_IP")
+        PORT=$(grep '^port ' "$CONFIG_FILE" | awk '{print $2}' || echo "443")
+        SERVER_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || echo "YOUR_SERVER_IP")
 
         echo "读取配置：端口 $PORT，服务器 IP $SERVER_IP"
         read -p "修改 IP？（回车保持）： " input_ip
         SERVER_IP=${input_ip:-$SERVER_IP}
 
-        read -p "客户端名称： " CLIENT_NAME
+        read -p "新客户端名称（例如 work、iphone14）： " CLIENT_NAME
         [ -z "$CLIENT_NAME" ] && { echo "必须输入名称"; continue; }
 
         echo "1) 有密码   2) 无密码（nopass）"
@@ -171,10 +149,10 @@ while true; do
 
         ./easyrsa build-client-full "$CLIENT_NAME" $EXTRA
 
-        CIPHER=$(grep '^cipher ' "$SERVER_CONF" | awk '{print $2}' || echo "AES-256-GCM")
-        AUTH=$(grep '^auth ' "$SERVER_CONF" | awk '{print $2}' || echo "SHA512")
+        CIPHER=$(grep '^cipher ' "$CONFIG_FILE" | awk '{print $2}' || echo "AES-256-GCM")
+        AUTH=$(grep '^auth ' "$CONFIG_FILE" | awk '{print $2}' || echo "SHA512")
 
-        cat > "${CLIENT_DIR}/client-${CLIENT_NAME}.ovpn" << EOF
+        cat > "/etc/openvpn/client-${CLIENT_NAME}.ovpn" << EOF
 client
 dev tun
 proto tcp
@@ -204,7 +182,7 @@ $(cat /etc/openvpn/ta.key)
 EOF
 
         echo ""
-        echo "客户端配置文件生成： ${CLIENT_DIR}/client-${CLIENT_NAME}.ovpn"
+        echo "客户端配置文件生成： /etc/openvpn/client-${CLIENT_NAME}.ovpn"
 
         read -p "是否立即为 $CLIENT_NAME 配置（LAN、固定IP、push 等）？(y/n，回车 y)： " configure_now
         configure_now=${configure_now:-y}
@@ -216,21 +194,20 @@ EOF
     fi
 
     # ─────────────────────────────────────────────────────────────
-    # 模式3：特定客户端配置
+    # 模式3：特定客户端配置（支持自动进入）
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "3" ]; then
-        if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$SERVER_CONF" ]; then
+        if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$CONFIG_FILE" ]; then
             echo "错误：服务端未正确安装。"
-            echo "按回车返回菜单..."
-            read -p ""
+            read -p "按回车返回菜单..."
             continue
         fi
 
         mkdir -p "$CCD_DIR"
-        grep -q '^client-config-dir' "$SERVER_CONF" || echo "client-config-dir $CCD_DIR" >> "$SERVER_CONF"
-        grep -q '^client-to-client' "$SERVER_CONF" || {
+        grep -q '^client-config-dir' "$CONFIG_FILE" || echo "client-config-dir $CCD_DIR" >> "$CONFIG_FILE"
+        grep -q '^client-to-client' "$CONFIG_FILE" || {
             read -p "是否启用 client-to-client？(y/n，回车 y)： " c2c
-            [ "${c2c:-y}" = "y" ] && echo "client-to-client" >> "$SERVER_CONF"
+            [ "${c2c:-y}" = "y" ] && echo "client-to-client" >> "$CONFIG_FILE"
         }
 
         echo ""
@@ -247,8 +224,7 @@ EOF
 
         if [ $count -eq 0 ]; then
             echo "暂无客户端证书。请先使用模式 1 添加。"
-            echo "按回车返回菜单..."
-            read -p ""
+            read -p "按回车返回菜单..."
             continue
         fi
 
@@ -325,8 +301,8 @@ EOF
         [ -n "$FIXED_IP" ] && echo "ifconfig-push $FIXED_IP $FIXED_MASK" >> "$CCD_FILE"
 
         if [ -n "$CLIENT_LAN_NET" ]; then
-            grep -q "route $CLIENT_LAN_NET" "$SERVER_CONF" || {
-                echo "route $CLIENT_LAN_NET $CLIENT_LAN_MASK" >> "$SERVER_CONF"
+            grep -q "route $CLIENT_LAN_NET" "$CONFIG_FILE" || {
+                echo "route $CLIENT_LAN_NET $CLIENT_LAN_MASK" >> "$CONFIG_FILE"
                 echo "已添加全局 route $CLIENT_LAN_NET $CLIENT_LAN_MASK"
             }
             echo "iroute $CLIENT_LAN_NET $CLIENT_LAN_MASK" >> "$CCD_FILE"
@@ -341,7 +317,7 @@ EOF
         cat "$CCD_FILE"
         echo ""
         echo "客户端侧需开启 IP 转发 + NAT（如需服务器访问其 LAN）"
-        echo "执行：rc-service openvpn restart"
+        echo "执行：$SERVICE_RESTART"
         echo ""
         echo "按回车返回主菜单..."
         read -p ""
@@ -352,31 +328,39 @@ EOF
     # 模式2：端口放行
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "2" ]; then
-        if [ ! -f "$SERVER_CONF" ]; then
-            echo "错误：服务端未安装。"
-            echo "按回车返回菜单..."
-            read -p ""
+        if [ ! -f "$CONFIG_FILE" ]; then
+            echo "服务端未安装，请先选择模式 5。"
+            read -p "按回车继续..."
             continue
         fi
 
-        PORT=$(grep '^port ' "$SERVER_CONF" | awk '{print $2}' || echo "51820")
+        PORT=$(grep '^port ' "$CONFIG_FILE" | awk '{print $2}' || echo "443")
         echo "当前监听端口：TCP $PORT"
 
-        read -p "是否自动放行端口（iptables + 开机持久）？输入 YES 确认： " confirm
+        read -p "是否自动放行端口？输入 YES 确认： " confirm
         if [ "$confirm" = "YES" ]; then
             iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-            mkdir -p /etc/local.d
-            cat > /etc/local.d/openvpn-firewall.start << EOF
+
+            if [ "$OS" = "alpine" ]; then
+                mkdir -p /etc/local.d
+                cat > /etc/local.d/openvpn-firewall.start << EOF
 #!/bin/sh
 iptables -I INPUT -p tcp --dport $PORT -j ACCEPT
 EOF
-            chmod +x /etc/local.d/openvpn-firewall.start
-            echo "已放行并创建开机规则。"
+                chmod +x /etc/local.d/openvpn-firewall.start
+            elif [ "$OS" = "debian" ]; then
+                echo "请安装 iptables-persistent 并保存规则："
+                echo "apt install iptables-persistent"
+                echo "netfilter-persistent save"
+            fi
+
+            echo "端口已放行。"
         fi
 
-        echo "当前 INPUT 链中相关规则："
+        echo ""
+        echo "当前 INPUT 链相关规则："
         iptables -L INPUT -v -n | grep "$PORT" || echo "未找到相关规则"
-        echo "提醒：云厂商安全组仍需手动放行 TCP $PORT"
+        echo "云厂商安全组仍需手动放行 TCP $PORT"
         echo ""
         echo "按回车返回主菜单..."
         read -p ""
@@ -387,10 +371,9 @@ EOF
     # 模式4：全局自定义配置
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "4" ]; then
-        if [ ! -f "$SERVER_CONF" ]; then
-            echo "错误：服务端未安装。"
-            echo "按回车返回菜单..."
-            read -p ""
+        if [ ! -f "$CONFIG_FILE" ]; then
+            echo "服务端未安装。"
+            read -p "按回车返回菜单..."
             continue
         fi
 
@@ -400,7 +383,7 @@ EOF
         read -p "是否修改中国IP绕过列表？(y/n)： " add_bypass
         if [ "$add_bypass" = "y" ] || [ "$add_bypass" = "Y" ]; then
             echo ""
-            echo "1) 使用默认列表（38条常见中国大陆段）"
+            echo "1) 使用默认列表（38条）"
             echo "2) 手动输入新列表（清空旧的）"
             echo "3) 追加到现有"
             echo "4) 跳过"
@@ -409,23 +392,23 @@ EOF
 
             case $ch in
                 1)
-                    sed -i '/^push "route .* net_gateway"/d' "$SERVER_CONF"
-                    echo "$DEFAULT_BYPASS_PUSH" >> "$SERVER_CONF"
+                    sed -i '/^push "route .* net_gateway"/d' "$CONFIG_FILE"
+                    echo "$DEFAULT_BYPASS_PUSH" >> "$CONFIG_FILE"
                     echo "已导入默认 38 条绕过段"
                     ;;
                 2)
-                    sed -i '/^push "route .* net_gateway"/d' "$SERVER_CONF"
+                    sed -i '/^push "route .* net_gateway"/d' "$CONFIG_FILE"
                     echo "请输入新段（格式 1.0.0.0 255.0.0.0，每行一个，空行结束）："
                     while read -p "> " line; do
                         [ -z "$line" ] && break
-                        echo "push \"route $line net_gateway\"" >> "$SERVER_CONF"
+                        echo "push \"route $line net_gateway\"" >> "$CONFIG_FILE"
                     done
                     ;;
                 3)
                     echo "请输入追加段（同上格式）："
                     while read -p "> " line; do
                         [ -z "$line" ] && break
-                        echo "push \"route $line net_gateway\"" >> "$SERVER_CONF"
+                        echo "push \"route $line net_gateway\"" >> "$CONFIG_FILE"
                     done
                     ;;
                 *) echo "跳过绕过修改" ;;
@@ -434,25 +417,26 @@ EOF
 
         read -p "是否更新全局 DNS push？(y/n)： " dns_yn
         if [ "$dns_yn" = "y" ] || [ "$dns_yn" = "Y" ]; then
-            read -p "输入 DNS（空格分隔，例如 192.168.5.4 223.5.5.5）： " dns_list
+            read -p "输入 DNS（空格分隔，例如 114.114.114.114 8.8.8.8）： " dns_list
             [ -n "$dns_list" ] && {
-                sed -i '/^push "dhcp-option DNS /d' "$SERVER_CONF"
-                for dns in $dns_list; do echo "push \"dhcp-option DNS $dns\"" >> "$SERVER_CONF"; done
+                sed -i '/^push "dhcp-option DNS /d' "$CONFIG_FILE"
+                for dns in $dns_list; do echo "push \"dhcp-option DNS $dns\"" >> "$CONFIG_FILE"; done
             }
         fi
 
-        read -p "是否添加/更新全局 LAN route/push（例如 192.168.5.0/24，回车跳过）： " lan
+        read -p "是否添加/更新全局 LAN route/push（例如 192.168.1.0/24，回车跳过）： " lan
         if [ -n "$lan" ]; then
             net=$(echo "$lan" | cut -d/ -f1)
             mask="255.255.255.0"
-            sed -i "/^route $net /d" "$SERVER_CONF"
-            sed -i "/^push \"route $net /d" "$SERVER_CONF"
-            echo "route $net $mask" >> "$SERVER_CONF"
-            echo "push \"route $net $mask\"" >> "$SERVER_CONF"
+            sed -i "/^route $net /d" "$CONFIG_FILE"
+            sed -i "/^push \"route $net /d" "$CONFIG_FILE"
+            echo "route $net $mask" >> "$CONFIG_FILE"
+            echo "push \"route $net $mask\"" >> "$CONFIG_FILE"
         fi
 
         echo ""
-        echo "全局配置更新完成。执行：rc-service openvpn restart"
+        echo "全局配置更新完成。"
+        echo "执行：$SERVICE_RESTART"
         echo "按回车返回主菜单..."
         read -p ""
         continue
@@ -466,18 +450,18 @@ EOF
         echo "=== 服务端安装 / 重新配置 ==="
         echo ""
 
-        PORT=51820
-        read -p "监听端口（默认 51820）： " p
-        PORT=${p:-51820}
+        PORT=443
+        read -p "监听端口（默认 443）： " p
+        PORT=${p:-443}
 
-        VPN_NET="10.10.0.0"
-        read -p "VPN 网段（默认 10.10.0.0）： " n
-        VPN_NET=${n:-10.10.0.0}
+        VPN_NET="10.8.0.0"
+        read -p "VPN 网段（默认 10.8.0.0）： " n
+        VPN_NET=${n:-10.8.0.0}
 
         echo ""
         echo "加密选项："
         echo "1) AES-256-GCM + SHA384"
-        echo "2) AES-256-GCM + SHA512（你的常用）"
+        echo "2) AES-256-GCM + SHA512"
         echo "3) AES-128-GCM + SHA256"
         echo "4) CHACHA20-POLY1305 + SHA256"
         echo "5) 无加密（仅测试！）"
@@ -485,52 +469,43 @@ EOF
         enc=${enc:-2}
 
         case "$enc" in
-            1)
-                CIPHER="AES-256-GCM"
-                AUTH="SHA384"
-                TLS_MIN="1.2"
-                ;;
-            2)
-                CIPHER="AES-256-GCM"
-                AUTH="SHA512"
-                TLS_MIN="1.2"
-                ;;
-            3)
-                CIPHER="AES-128-GCM"
-                AUTH="SHA256"
-                TLS_MIN="1.2"
-                ;;
-            4)
-                CIPHER="CHACHA20-POLY1305"
-                AUTH="SHA256"
-                TLS_MIN="1.2"
-                ;;
+            1) CIPHER="AES-256-GCM"; AUTH="SHA384";  TLS_MIN="1.2" ;;
+            2) CIPHER="AES-256-GCM"; AUTH="SHA512";  TLS_MIN="1.2" ;;
+            3) CIPHER="AES-128-GCM"; AUTH="SHA256";  TLS_MIN="1.2" ;;
+            4) CIPHER="CHACHA20-POLY1305"; AUTH="SHA256"; TLS_MIN="1.2" ;;
             5)
                 echo "警告：无加密模式！数据明文传输。"
-                read -p "真的要继续？输入 YES（大写）确认，否则按回车退出： " confirm
-                if [ "$confirm" != "YES" ]; then
-                    echo "已取消安装。"
-                    continue
-                fi
-                CIPHER="none"
-                AUTH="none"
-                TLS_MIN="1.2"
+                read -p "输入 YES 确认： " confirm
+                [ "$confirm" != "YES" ] && continue
+                CIPHER="none"; AUTH="none"; TLS_MIN="1.2"
                 ;;
             *)
-                echo "无效选择，使用默认（AES-256-GCM + SHA512）"
-                CIPHER="AES-256-GCM"
-                AUTH="SHA512"
-                TLS_MIN="1.2"
+                CIPHER="AES-256-GCM"; AUTH="SHA512"; TLS_MIN="1.2"
                 ;;
         esac
 
         echo "配置预览：端口 $PORT，网段 $VPN_NET/24，$CIPHER + $AUTH"
         sleep 3
 
-        apk add --no-cache openvpn easy-rsa iptables openssl ca-certificates curl
+        # 安装依赖
+        if [ "$OS" = "alpine" ]; then
+            $PKG_INSTALL openvpn easy-rsa iptables openssl ca-certificates curl
+        else
+            $PKG_UPDATE
+            $PKG_INSTALL openvpn easy-rsa iptables-persistent net-tools curl
+        fi
 
+        # 初始化 easy-rsa
         mkdir -p "$EASYRSA_DIR"
-        cp -r /usr/share/easy-rsa/* "$EASYRSA_DIR/" 2>/dev/null || true
+        if [ "$OS" = "alpine" ]; then
+            cp -r /usr/share/easy-rsa/* "$EASYRSA_DIR/" 2>/dev/null || true
+        else
+            # Debian/Ubuntu 通常需要手动初始化或复制
+            if [ ! -d "$EASYRSA_DIR/pki" ]; then
+                make-cadir "$EASYRSA_DIR"
+            fi
+        fi
+
         cd "$EASYRSA_DIR"
 
         cat > vars << EOF
@@ -556,10 +531,10 @@ EOF
 
         mkdir -p "$CCD_DIR"
 
-        SERVER_IP=$(curl -s https://api.ipify.org || curl -s https://icanhazip.com || ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+        SERVER_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
         [ -z "$SERVER_IP" ] && read -p "无法获取公网IP，请手动输入：" SERVER_IP
 
-        cat > "$SERVER_CONF" << EOF
+        cat > "$CONFIG_FILE" << EOF
 port $PORT
 proto tcp
 dev tun
@@ -583,75 +558,73 @@ auth $AUTH
 tls-version-min $TLS_MIN
 
 user nobody
-group nobody
+group nogroup
 persist-key
 persist-tun
 verb 3
 EOF
 
-        echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+        # IP 转发
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
         sysctl -p
 
+        # NAT
         OUT_IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
         iptables -t nat -A POSTROUTING -s ${VPN_NET}/24 -o "$OUT_IFACE" -j MASQUERADE
 
-        mkdir -p /etc/local.d
-        cat > /etc/local.d/openvpn-nat.start << EOF
+        # 持久化
+        if [ "$OS" = "alpine" ]; then
+            cat > "$PERSIST_FILE" << EOF
 #!/bin/sh
 iptables -t nat -A POSTROUTING -s ${VPN_NET}/24 -o $OUT_IFACE -j MASQUERADE
+iptables -I INPUT -p tcp --dport $PORT -j ACCEPT
 EOF
-        chmod +x /etc/local.d/openvpn-nat.start
+            chmod +x "$PERSIST_FILE"
+        else
+            iptables-save > /etc/iptables/rules.v4
+            echo "已保存 iptables 规则到 /etc/iptables/rules.v4"
+            echo "请确保 iptables-persistent 已安装，并运行：netfilter-persistent save"
+        fi
 
-        rc-update add openvpn default
-        rc-service openvpn restart || rc-service openvpn start
+        # 启动服务
+        $SERVICE_ENABLE
+        $SERVICE_RESTART
 
         echo ""
         echo "服务端安装完成。"
         echo "端口：$PORT    IP：$SERVER_IP"
-        echo "配置文件路径：$SERVER_CONF"
-        echo "请使用模式 1 添加客户端，模式 3/4 配置路由/DNS"
-        echo "云安全组记得放行 TCP $PORT"
+        echo "配置文件：$CONFIG_FILE"
+        echo ""
         echo "按回车返回主菜单..."
         read -p ""
         continue
     fi
 
     # ─────────────────────────────────────────────────────────────
-    # 模式6：卸载 OpenVPN 和所有配置
+    # 模式6：卸载
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "6" ]; then
-        echo "=== 卸载 OpenVPN 和所有配置 ==="
-        echo "警告：这将删除所有证书、配置文件、NAT规则、开机自启等！"
-        echo "此操作不可逆，请确认是否继续。"
-        read -p "输入 YES（大写）确认卸载，否则按回车退出： " confirm
+        echo "=== 卸载 OpenVPN ==="
+        echo "警告：这将删除所有证书、配置、规则等！"
+        read -p "输入 YES 确认卸载： " confirm
         if [ "$confirm" != "YES" ]; then
-            echo "已取消卸载。"
             continue
         fi
 
-        echo "正在卸载..."
+        $SERVICE_STOP 2>/dev/null || true
+        $SERVICE_DISABLE 2>/dev/null || true
 
-        rc-service openvpn stop 2>/dev/null || true
-        rc-update del openvpn default 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null || true
 
-        iptables -t nat -D POSTROUTING -s 10.10.0.0/24 -j MASQUERADE 2>/dev/null || true
-        PORT=$(grep '^port ' "$SERVER_CONF" 2>/dev/null | awk '{print $2}' || echo "51820")
-        iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+        rm -rf /etc/openvpn/* "$EASYRSA_DIR" 2>/dev/null
+        rm -f "$PERSIST_FILE" 2>/dev/null
 
-        rm -f /etc/local.d/openvpn-nat.start /etc/local.d/openvpn-firewall.start 2>/dev/null
+        $PKG_REMOVE openvpn easy-rsa iptables iptables-persistent openssl ca-certificates curl 2>/dev/null || true
 
-        rm -rf /etc/openvpn/* 2>/dev/null
-        rm -rf "$EASYRSA_DIR" 2>/dev/null
-
-        apk del --purge openvpn easy-rsa iptables openssl ca-certificates curl 2>/dev/null || true
-
-        sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf 2>/dev/null
+        sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf
         sysctl -p 2>/dev/null || true
 
-        echo ""
-        echo "卸载完成！"
-        echo "已删除所有 OpenVPN 相关文件、证书、规则和包。"
-        echo "如需重新安装，请再次运行脚本并选择模式 5。"
+        echo "卸载完成。"
         echo "按回车返回主菜单..."
         read -p ""
         continue
@@ -661,15 +634,14 @@ EOF
     # 模式7：删除指定客户端
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "7" ]; then
-        if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$SERVER_CONF" ]; then
-            echo "错误：服务端未正确安装。"
-            echo "按回车返回菜单..."
-            read -p ""
+        if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$CONFIG_FILE" ]; then
+            echo "服务端未正确安装。"
+            read -p "按回车返回菜单..."
             continue
         fi
 
         echo ""
-        echo "当前客户端证书列表（可删除）："
+        echo "当前客户端证书列表："
 
         CLIENTS=""
         count=0
@@ -682,8 +654,7 @@ EOF
 
         if [ $count -eq 0 ]; then
             echo "暂无客户端证书可删除。"
-            echo "按回车返回菜单..."
-            read -p ""
+            read -p "按回车返回菜单..."
             continue
         fi
 
@@ -696,7 +667,7 @@ EOF
         done
         echo ""
 
-        read -p "请输入要删除的客户端编号（1-$((i-1))，q取消）： " del_choice
+        read -p "要删除的客户端编号（1-$((i-1))，q取消）： " del_choice
         [ "$del_choice" = "q" ] || [ "$del_choice" = "Q" ] && continue
 
         if ! echo "$del_choice" | grep -qE '^[0-9]+$' || [ "$del_choice" -lt 1 ] || [ "$del_choice" -ge $i ]; then
@@ -713,31 +684,28 @@ EOF
         DEL_CLIENT="$1"
         echo "将删除客户端：$DEL_CLIENT"
 
-        read -p "确认删除 $DEL_CLIENT 及其所有相关文件？(y/n，回车 n)： " del_confirm
+        read -p "确认删除 $DEL_CLIENT？(y/n，回车 n)： " del_confirm
         del_confirm=${del_confirm:-n}
 
         if [ "$del_confirm" != "y" ] && [ "$del_confirm" != "Y" ]; then
-            echo "取消删除。"
             continue
         fi
 
         cd "$EASYRSA_DIR"
 
-        # 撤销证书并更新 CRL
-        echo "yes" | ./easyrsa revoke "$DEL_CLIENT" 2>/dev/null || echo "撤销证书失败（可能已撤销）"
+        echo "yes" | ./easyrsa revoke "$DEL_CLIENT" 2>/dev/null || echo "撤销失败（可能已撤销）"
         ./easyrsa gen-crl
         cp pki/crl.pem /etc/openvpn/ 2>/dev/null || true
 
-        # 删除文件
         rm -f "pki/issued/${DEL_CLIENT}.crt" 2>/dev/null
         rm -f "pki/private/${DEL_CLIENT}.key" 2>/dev/null
         rm -f "$CCD_DIR/$DEL_CLIENT" 2>/dev/null
-        rm -f "$CLIENT_DIR/client-${DEL_CLIENT}.ovpn" 2>/dev/null
+        rm -f "/etc/openvpn/client-${DEL_CLIENT}.ovpn" 2>/dev/null
 
         echo ""
-        echo "已删除客户端 $DEL_CLIENT 的所有文件和证书记录。"
-        echo "CRL 已更新，客户端将无法继续连接。"
-        echo "建议执行：rc-service openvpn restart"
+        echo "已删除 $DEL_CLIENT 相关文件和证书记录。"
+        echo "CRL 已更新。"
+        echo "建议执行：$SERVICE_RESTART"
         echo ""
         echo "按回车返回主菜单..."
         read -p ""
