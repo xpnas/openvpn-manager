@@ -32,7 +32,7 @@
 ### 下载脚本
    #### 服务端：
    ```bash
-   wget -O openvpn-manager.sh https://raw.githubusercontent.com/xpnas/openvpn-manager/master/openvpn-manager.sh && chmod +x openvpn-manager.sh && ./openvpn-manager.sh
+   wget -O openvpn-manager.sh https://raw.githubusercontent.com/xpnas/openvpn-manager/master/openvpn-server-manager.sh && chmod +x openvpn-server-manager.sh && ./openvpn-server-manager.sh
    ```
    #### 客户端：
    ```bash
