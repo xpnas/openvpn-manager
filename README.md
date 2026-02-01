@@ -30,7 +30,13 @@
 ## 使用方法
 
 ### 下载脚本
+   #### 服务端：
    ```bash
    wget -O openvpn-manager.sh https://raw.githubusercontent.com/xpnas/openvpn-manager/master/openvpn-manager.sh && chmod +x openvpn-manager.sh && ./openvpn-manager.sh
    ```
+   #### 客户端：
+   ```bash
+   wget -O openvpn-manager.sh https://raw.githubusercontent.com/xpnas/openvpn-manager/master/openvpn-client-manager.sh && chmod +x openvpn-client-manager.sh && ./openvpn-client-manager.sh
+   ```
+   
 
