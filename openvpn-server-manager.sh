@@ -1,6 +1,6 @@
 #!/bin/sh
 # OpenVPN TCP 管理脚本 - 兼容 Alpine & Debian/Ubuntu (单文件完整版)
-# 功能：安装服务端 / 添加客户端 / 端口放行 / 特定客户端配置 / 全局配置 / 卸载 / 删除客户端
+# 功能：安装服务端 / 添加客户端 / 端口放行 / 特定客户端配置 / 全局配置 / 卸载 / 删除客户端 / 重启服务 / 停止服务 / 开机启动 / 关闭开机启动
 # 自动检测系统类型并适配
 # POSIX 兼容写法，适用于 ash / bash
 
@@ -42,6 +42,11 @@ else
     exit 1
 fi
 
+# ─────────────────────────────────────────────────────────────
+# 全局变量定义
+# ─────────────────────────────────────────────────────────────
+CCD_DIR="/etc/openvpn/ccd"
+EASYRSA_DIR="/etc/openvpn/easy-rsa"
 echo "检测到系统：$OS"
 echo "配置文件路径：$CONFIG_FILE"
 echo ""
@@ -107,9 +112,13 @@ while true; do
         echo "5) 重新安装/覆盖服务端配置"
         echo "6) 卸载 OpenVPN 和所有配置"
         echo "7) 删除指定客户端"
+        echo "8) 重启 OpenVPN 服务"
+        echo "9) 停止 OpenVPN 服务"
+        echo "10) 开机启动 OpenVPN 服务"
+        echo "11) 关闭开机启动 OpenVPN 服务"
         echo "0) 退出脚本"
         echo ""
-        read -p "请选择操作（0~7，回车默认1）： " mode_choice
+        read -p "请选择操作（0~11，回车默认1）： " mode_choice
         MODE=${mode_choice:-1}
     else
         echo "未检测到服务端配置，将引导安装。"
@@ -344,7 +353,6 @@ EOF
             if [ "$OS" = "alpine" ]; then
                 mkdir -p /etc/local.d
                 cat > /etc/local.d/openvpn-firewall.start << EOF
-#!/bin/sh
 iptables -I INPUT -p tcp --dport $PORT -j ACCEPT
 EOF
                 chmod +x /etc/local.d/openvpn-firewall.start
@@ -528,9 +536,7 @@ EOF
 
         cp pki/ca.crt pki/private/ca.key pki/issued/server.crt pki/private/server.key pki/dh.pem ta.key /etc/openvpn/
         cp pki/crl.pem /etc/openvpn/ 2>/dev/null || true
-
         mkdir -p "$CCD_DIR"
-
         SERVER_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
         [ -z "$SERVER_IP" ] && read -p "无法获取公网IP，请手动输入：" SERVER_IP
 
@@ -708,6 +714,50 @@ EOF
         echo "建议执行：$SERVICE_RESTART"
         echo ""
         echo "按回车返回主菜单..."
+        read -p ""
+        continue
+    fi
+
+    # ─────────────────────────────────────────────────────────────
+    # 模式8：重启 OpenVPN 服务
+    # ─────────────────────────────────────────────────────────────
+    if [ "$MODE" = "8" ]; then
+        echo "正在重启 OpenVPN 服务..."
+        $SERVICE_RESTART
+        echo "服务已重启。按回车返回主菜单..."
+        read -p ""
+        continue
+    fi
+
+    # ─────────────────────────────────────────────────────────────
+    # 模式9：停止 OpenVPN 服务
+    # ─────────────────────────────────────────────────────────────
+    if [ "$MODE" = "9" ]; then
+        echo "正在停止 OpenVPN 服务..."
+        $SERVICE_STOP
+        echo "服务已停止。按回车返回主菜单..."
+        read -p ""
+        continue
+    fi
+
+    # ─────────────────────────────────────────────────────────────
+    # 模式10：开机启动 OpenVPN 服务
+    # ─────────────────────────────────────────────────────────────
+    if [ "$MODE" = "10" ]; then
+        echo "正在设置 OpenVPN 服务为开机启动..."
+        $SERVICE_ENABLE
+        echo "服务已设置为开机启动。按回车返回主菜单..."
+        read -p ""
+        continue
+    fi
+
+    # ─────────────────────────────────────────────────────────────
+    # 模式11：关闭开机启动 OpenVPN 服务
+    # ─────────────────────────────────────────────────────────────
+    if [ "$MODE" = "11" ]; then
+        echo "正在关闭 OpenVPN 服务的开机启动..."
+        $SERVICE_DISABLE
+        echo "服务已设置为不在开机时启动。按回车返回主菜单..."
         read -p ""
         continue
     fi
