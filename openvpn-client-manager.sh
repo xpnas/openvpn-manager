@@ -1,4 +1,4 @@
-#!/bin/sh
+﻿#!/bin/sh
 # 
 # OpenVPN 客户端管理脚本 v2.0 - 兼容 Alpine & Debian/Ubuntu
 # 功能增强版：
@@ -22,6 +22,19 @@ msg_err()  { printf "%s[ERR] %s%s\n" "${RED}"    "$1" "${RESET}"; }
 msg_warn() { printf "%s[WARN] %s%s\n" "${YELLOW}" "$1" "${RESET}"; }
 msg_info() { printf "%s[INFO] %s%s\n" "${CYAN}"   "$1" "${RESET}"; }
 
+# ─────────────────────────────────────────────────────────────
+# 防火墙后端检测（返回 "iptables" 或 "nftables"）
+# ─────────────────────────────────────────────────────────────
+detect_firewall() {
+    if command -v iptables >/dev/null 2>&1 && iptables -L >/dev/null 2>&1; then
+        echo "iptables"
+    elif command -v nft >/dev/null 2>&1; then
+        echo "nftables"
+    else
+        echo "none"
+    fi
+}
+
 # 
 # 审计日志
 # 
@@ -29,6 +42,9 @@ AUDIT_LOG="/var/log/openvpn-client-admin.log"
 audit() {
     _ts=$(date '+%Y-%m-%d %H:%M:%S')
     _user=$(whoami)
+    mkdir -p /var/log 2>/dev/null || true
+    touch "$AUDIT_LOG" 2>/dev/null || true
+    chmod 640 "$AUDIT_LOG" 2>/dev/null || true
     printf '[%s] user=%s action="%s"\n' "$_ts" "$_user" "$*" >> "$AUDIT_LOG" 2>/dev/null || true
 }
 
@@ -118,10 +134,14 @@ list_profiles() {
     for _p in "$PROFILES_DIR"/*.ovpn; do
         [ ! -f "$_p" ] && continue
         _pname=$(basename "$_p" .ovpn)
-        PROFILE_LIST="$PROFILE_LIST $_pname"
+        if [ -z "$PROFILE_LIST" ]; then
+            PROFILE_LIST="$_pname"
+        else
+            PROFILE_LIST="$PROFILE_LIST
+$_pname"
+        fi
         PROFILE_COUNT=$((PROFILE_COUNT + 1))
     done
-    PROFILE_LIST=$(echo "$PROFILE_LIST" | sed 's/^ //')
 }
 
 # 
@@ -135,7 +155,8 @@ select_profile() {
         SELECTED_PROFILE=""
         return 1
     fi
-    set -- $PROFILE_LIST
+    _OIFS="$IFS"; IFS='
+'; set -- $PROFILE_LIST; IFS="$_OIFS"
     _i=1
     while [ $# -gt 0 ]; do
         _active=""
@@ -150,14 +171,15 @@ select_profile() {
     done
     echo ""
     printf "%s (1-%s, q=back): " "$_prompt" "$((_i - 1))"
-    read _sel
+    read -r _sel
     [ "$_sel" = "q" ] || [ "$_sel" = "Q" ] && { SELECTED_PROFILE=""; return 1; }
     if ! echo "$_sel" | grep -qE '^[0-9]+$' || [ "$_sel" -lt 1 ] || [ "$_sel" -ge "$_i" ]; then
         msg_err "无效选择"
         SELECTED_PROFILE=""
         return 1
     fi
-    set -- $PROFILE_LIST
+    _OIFS="$IFS"; IFS='
+'; set -- $PROFILE_LIST; IFS="$_OIFS"
     _j=1
     while [ "$_j" -lt "$_sel" ]; do shift; _j=$((_j + 1)); done
     SELECTED_PROFILE="$1"
@@ -177,7 +199,7 @@ check_dns_leak() {
     fi
 
     msg_info "正在检测公网 IP..."
-    _pub_ip=$(curl -s --max-time 10 ifconfig.me 2>/dev/null || curl -s --max-time 10 icanhazip.com 2>/dev/null)
+    _pub_ip=$(curl -4 -s --connect-timeout 5 --max-time 10 ifconfig.me 2>/dev/null || curl -4 -s --connect-timeout 5 --max-time 10 icanhazip.com 2>/dev/null)
     if [ -n "$_pub_ip" ]; then
         msg_info "当前公网 IP: $_pub_ip"
     else
@@ -296,7 +318,7 @@ if [ $# -gt 0 ]; then
         --list)
             list_profiles
             if [ "$PROFILE_COUNT" -eq 0 ]; then echo "暂无配置文件"
-            else echo "$PROFILE_LIST" | tr ' ' '\n'; fi
+            else printf '%s\n' $PROFILE_LIST; fi
             exit 0
             ;;
         --reconnect)
@@ -379,7 +401,7 @@ while true; do
     echo " ${RED} 0)${RESET} 退出脚本"
     echo ""
     printf "请选择操作（0~13，回车默认3）： "
-    read mode_choice
+    read -r mode_choice
     MODE=${mode_choice:-3}
 
     [ "$MODE" = "0" ] && { echo "已退出脚本。"; exit 0; }
@@ -390,44 +412,45 @@ while true; do
     if [ "$MODE" = "1" ]; then
         msg_info "正在安装 OpenVPN 客户端..."
         $PKG_UPDATE || msg_warn "更新包索引失败"
-        $PKG_INSTALL openvpn || msg_warn "安装失败"
+        # curl 用于公网 IP 检测和 DNS 泄漏检测，一并安装
+        $PKG_INSTALL openvpn curl || msg_warn "安装失败"
+
+        # 开启 IP 转发（网关客户端角色必需，普通客户端无害）
+        if ! grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null; then
+            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+            msg_info "已添加 net.ipv4.ip_forward=1 到 sysctl.conf"
+        fi
+        sysctl -p 2>/dev/null || sysctl -w net.ipv4.ip_forward=1 2>/dev/null
+        msg_ok "IP 转发已开启"
 
         if [ "$OS" = "alpine" ]; then
-            # Alpine: 启用 sysctl 服务（确保 net.ipv4.ip_forward 等内核参数生效）
+            # Alpine: 启用 sysctl 服务
             if ! rc-update show default 2>/dev/null | grep -q sysctl; then
                 rc-update add sysctl default 2>/dev/null && msg_ok "已添加 sysctl 到开机启动"
             fi
             rc-service sysctl start 2>/dev/null || true
-
-            # 确保 IP 转发开启
-            if ! grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null; then
-                echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-                msg_info "已添加 net.ipv4.ip_forward=1 到 sysctl.conf"
-            fi
-            sysctl -p 2>/dev/null || sysctl -w net.ipv4.ip_forward=1 2>/dev/null
-
             # Alpine: 默认设置 OpenVPN 开机自启
             rc-update add openvpn default 2>/dev/null && msg_ok "已设置 OpenVPN 开机自启"
         fi
 
         audit "安装 OpenVPN 客户端"
         msg_ok "安装完成。"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # 
     # 模式2：导入 .ovpn 配置文件
     # 
     if [ "$MODE" = "2" ]; then
-        printf "请输入 .ovpn 文件完整路径： "; read ovpn_path
+        printf "请输入 .ovpn 文件完整路径： "; read -r ovpn_path
 
         if [ -z "$ovpn_path" ] || [ ! -f "$ovpn_path" ]; then
             msg_err "文件不存在或路径无效"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         _default_name=$(basename "$ovpn_path" .ovpn)
-        printf "配置名称（回车使用 %s）： " "$_default_name"; read _pname
+        printf "配置名称（回车使用 %s）： " "$_default_name"; read -r _pname
         _pname=${_pname:-$_default_name}
 
         # 保存到 profiles 目录
@@ -465,7 +488,7 @@ while true; do
 
         audit "导入配置: $_pname (来源: $ovpn_path)"
         msg_ok "导入完成: 已保存为 '$_pname' 并设为当前活动配置"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─
@@ -475,13 +498,13 @@ while true; do
         if [ ! -f "$CONFIG_FILE" ]; then
             msg_err "未找到配置文件 $CONFIG_FILE"
             msg_info "请先使用模式 2 导入"
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
 
         if check_vpn_connected; then
             get_vpn_info
             msg_warn "VPN 已连接 (IP: ${VPN_IP:-未知})"
-            printf "是否断开后重连？(y/n，回车 n)： "; read _rc
+            printf "是否断开后重连？(y/n，回车 n)： "; read -r _rc
             if [ "${_rc:-n}" != "y" ]; then continue; fi
             $SERVICE_STOP 2>/dev/null || true
             sleep 1
@@ -490,13 +513,13 @@ while true; do
         msg_info "正在连接 VPN..."
         $SERVICE_START >/dev/null 2>&1 || true
 
-        echo "检查连接状态（每1秒检查一次，最多10次）..."
+        echo "检查连接状态（每1秒检查一次，最多15次）..."
 
         SUCCESS=0
         i=1
-        while [ "$i" -le 10 ]; do
+        while [ "$i" -le 15 ]; do
             sleep 1
-            printf "  检查 %d/10..." "$i"
+            printf "  检查 %d/15..." "$i"
 
             if check_vpn_connected; then
                 get_vpn_info
@@ -526,7 +549,7 @@ while true; do
 
         if [ "$SUCCESS" -eq 0 ]; then
             echo ""
-            msg_err "连接未成功（10秒内未检测到完成标志）"
+            msg_err "连接未成功（15秒内未检测到完成标志）"
             msg_info "请使用模式 7 查看详细日志"
             if [ -f "$LOG_FILE" ]; then
                 echo ""
@@ -536,7 +559,7 @@ while true; do
         fi
 
         audit "连接 VPN: success=$SUCCESS"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # 
@@ -553,7 +576,7 @@ while true; do
         fi
         audit "断开 VPN"
         msg_ok "断开完成"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # 
@@ -562,12 +585,12 @@ while true; do
     if [ "$MODE" = "5" ]; then
         if [ ! -f "$CONFIG_FILE" ]; then
             msg_err "未找到配置文件"
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
         $SERVICE_ENABLE 2>/dev/null || true
         audit "设置开机自启"
         msg_ok "已设置开机自启"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # 
@@ -577,7 +600,7 @@ while true; do
         $SERVICE_DISABLE 2>/dev/null || true
         audit "取消开机自启"
         msg_ok "已取消开机自启"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # 
@@ -591,7 +614,9 @@ while true; do
         if [ "$OS" = "alpine" ]; then
             rc-service openvpn status 2>/dev/null || msg_warn "  服务未运行"
         else
-            systemctl is-active openvpn@client >/dev/null 2>&1 && msg_ok "  服务运行中" || msg_err "  服务未运行"
+            # 使用已配置的服务命令变量，而非写态 openvpn@client
+            _svc_name=$(echo "$SERVICE_START" | awk '{print $NF}')
+            systemctl is-active "$_svc_name" >/dev/null 2>&1 && msg_ok "  服务运行中" || msg_err "  服务未运行"
         fi
         echo ""
 
@@ -622,7 +647,7 @@ while true; do
             echo "  日志文件尚未生成"
         fi
 
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # 
@@ -630,7 +655,7 @@ while true; do
     # 
     if [ "$MODE" = "8" ]; then
         msg_warn "将删除所有配置和日志！"
-        printf "输入 YES 确认： "; read confirm
+        printf "输入 YES 确认： "; read -r confirm
         [ "$confirm" != "YES" ] && continue
 
         $SERVICE_STOP 2>/dev/null || true
@@ -641,7 +666,7 @@ while true; do
 
         audit "卸载 OpenVPN 客户端"
         msg_ok "卸载完成。"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─
@@ -656,11 +681,12 @@ while true; do
         if [ "$PROFILE_COUNT" -eq 0 ]; then
             msg_warn "暂无已保存的配置文件"
             msg_info "使用模式 2 导入 .ovpn 文件"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         echo "已保存的配置文件："
-        set -- $PROFILE_LIST
+        _OIFS="$IFS"; IFS='
+'; set -- $PROFILE_LIST; IFS="$_OIFS"
         _i=1
         while [ $# -gt 0 ]; do
             _active=""
@@ -683,7 +709,7 @@ while true; do
         echo "  d) 删除某个配置"
         echo "  r) 重命名某个配置"
         echo "  q) 返回主菜单"
-        printf "选择操作： "; read _op
+        printf "选择操作： "; read -r _op
 
         case "$_op" in
             a)
@@ -695,7 +721,7 @@ while true; do
                 fi ;;
             d)
                 if select_profile "选择要删除的配置"; then
-                    printf "确认删除 %s？(y/n)： " "$SELECTED_PROFILE"; read _dc
+                    printf "确认删除 %s？(y/n)： " "$SELECTED_PROFILE"; read -r _dc
                     if [ "$_dc" = "y" ]; then
                         rm -f "$PROFILES_DIR/${SELECTED_PROFILE}.ovpn"
                         audit "删除配置: $SELECTED_PROFILE"
@@ -704,7 +730,7 @@ while true; do
                 fi ;;
             r)
                 if select_profile "选择要重命名的配置"; then
-                    printf "新名称： "; read _nn
+                    printf "新名称： "; read -r _nn
                     if [ -n "$_nn" ]; then
                         mv "$PROFILES_DIR/${SELECTED_PROFILE}.ovpn" "$PROFILES_DIR/${_nn}.ovpn"
                         audit "重命名: $SELECTED_PROFILE -> $_nn"
@@ -713,7 +739,7 @@ while true; do
                 fi ;;
         esac
 
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # 
@@ -724,7 +750,7 @@ while true; do
         echo ""
 
         if ! select_profile "选择要连接的配置"; then
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
 
         msg_info "正在切换到: $SELECTED_PROFILE"
@@ -739,9 +765,9 @@ while true; do
 
         SUCCESS=0
         i=1
-        while [ "$i" -le 10 ]; do
+        while [ "$i" -le 15 ]; do
             sleep 1
-            printf "  检查 %d/10...\n" "$i"
+            printf "  检查 %d/15...\n" "$i"
             if check_vpn_connected; then
                 get_vpn_info
                 SUCCESS=1
@@ -754,7 +780,7 @@ while true; do
         [ "$SUCCESS" -eq 0 ] && msg_err "连接失败，请检查日志"
 
         audit "切换配置并连接: $SELECTED_PROFILE success=$SUCCESS"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # 
@@ -762,7 +788,7 @@ while true; do
     # ─
     if [ "$MODE" = "11" ]; then
         check_dns_leak
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─
@@ -782,7 +808,7 @@ while true; do
             echo "1) 更新配置"
             echo "2) 删除自动重连"
             echo "3) 返回"
-            printf "选择： "; read _wop
+            printf "选择： "; read -r _wop
             case "$_wop" in
                 2)
                     _running_pid=$(pgrep -f 'openvpn-watchdog' 2>/dev/null | head -1)
@@ -792,15 +818,15 @@ while true; do
                     rm -f /etc/local.d/openvpn-watchdog.start 2>/dev/null
                     audit "删除自动重连守护"
                     msg_ok "已删除自动重连"
-                    printf "按回车继续..."; read dummy; continue ;;
+                    printf "按回车继续..."; read -r dummy; continue ;;
                 3) continue ;;
             esac
         fi
 
-        printf "检查间隔（秒，默认 30）： "; read _intv
+        printf "检查间隔（秒，默认 30）： "; read -r _intv
         WATCHDOG_INTERVAL=${_intv:-30}
 
-        printf "连续失败多少次后重启服务？（默认 3）： "; read _max
+        printf "连续失败多少次后重启服务？（默认 3）： "; read -r _max
         WATCHDOG_MAX=${_max:-3}
 
         cat > "$WATCHDOG_SCRIPT" << WATCHEOF
@@ -811,7 +837,10 @@ MAX_FAIL=$WATCHDOG_MAX
 FAIL_COUNT=0
 
 while true; do
-    if ip link show tun0 >/dev/null 2>&1; then
+    # 与主脚本 check_vpn_connected 逻辑完全一致：
+    # 同时验证 tun0 接口存在 + IP 地址已分配，避免 tun0 起来但无 IP 时误判为正常
+    _tun_ip=\$(ip -4 addr show tun0 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1)
+    if ip link show tun0 >/dev/null 2>&1 && [ -n "\$_tun_ip" ]; then
         FAIL_COUNT=0
     else
         FAIL_COUNT=\$((FAIL_COUNT + 1))
@@ -853,11 +882,26 @@ WDEOF
             (crontab -l 2>/dev/null | grep -v 'openvpn-watchdog'; echo "@reboot nohup $WATCHDOG_SCRIPT >/dev/null 2>&1 &") | crontab - 2>/dev/null || true
         fi
 
+        # 配置 logrotate（防止 watchdog 日志无限增长）
+        if command -v logrotate >/dev/null 2>&1; then
+            cat > /etc/logrotate.d/openvpn-client << 'LREOF'
+/var/log/openvpn-watchdog.log /var/log/openvpn-client-admin.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+LREOF
+        fi
+
         audit "配置自动重连: interval=${WATCHDOG_INTERVAL}s max_fail=$WATCHDOG_MAX pid=$_new_pid"
         msg_ok "自动重连守护已启动 (PID: $_new_pid)"
         msg_info "间隔: ${WATCHDOG_INTERVAL}秒  阈值: ${WATCHDOG_MAX}次失败后重启"
         msg_info "守护日志: /var/log/openvpn-watchdog.log"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─
@@ -869,10 +913,10 @@ WDEOF
 
         if [ ! -f "$AUDIT_LOG" ]; then
             msg_warn "审计日志尚未生成"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
-        printf "显示最近多少条？（默认 50）： "; read _n
+        printf "显示最近多少条？（默认 50）： "; read -r _n
         _n=${_n:-50}
 
         echo "------------------------------------------------------------"
@@ -881,9 +925,9 @@ WDEOF
         _total=$(wc -l < "$AUDIT_LOG")
         msg_info "共 $_total 条记录，显示最近 $_n 条"
 
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     msg_warn "无效选项"
-    printf "按回车返回主菜单..."; read dummy
+    printf "按回车返回主菜单..."; read -r dummy
 done

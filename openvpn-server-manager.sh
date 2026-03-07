@@ -1,4 +1,4 @@
-#!/bin/sh
+﻿#!/bin/sh
 # ═══════════════════════════════════════════════════════════════
 # OpenVPN 服务端管理脚本 v2.0 - 兼容 Alpine & Debian/Ubuntu
 # 功能增强版：
@@ -29,6 +29,9 @@ AUDIT_LOG="/var/log/openvpn-admin.log"
 audit() {
     _ts=$(date '+%Y-%m-%d %H:%M:%S')
     _user=$(whoami)
+    mkdir -p /var/log 2>/dev/null || true
+    touch "$AUDIT_LOG" 2>/dev/null || true
+    chmod 640 "$AUDIT_LOG" 2>/dev/null || true
     printf '[%s] user=%s action="%s"\n' "$_ts" "$_user" "$*" >> "$AUDIT_LOG" 2>/dev/null || true
 }
 
@@ -51,6 +54,96 @@ sed_inplace() {
 }
 
 # ─────────────────────────────────────────────────────────────
+# 输入名称安全过滤（仅保留字母、数字、下划线、连字符，最长 64 字符）
+# ─────────────────────────────────────────────────────────────
+sanitize_name() {
+    echo "$1" | tr -cd '[:alnum:]_-' | cut -c1-64
+}
+
+# ─────────────────────────────────────────────────────────────
+# 防火墙后端检测（返回 "iptables" 或 "nftables"）
+# ─────────────────────────────────────────────────────────────
+detect_firewall() {
+    if command -v iptables >/dev/null 2>&1 && iptables -L >/dev/null 2>&1; then
+        echo "iptables"
+    elif command -v nft >/dev/null 2>&1; then
+        echo "nftables"
+    else
+        echo "none"
+    fi
+}
+
+# 放行端口 INPUT 规则（iptables / nftables）
+fw_allow_port() {
+    _proto="$1"; _port="$2"
+    _fw=$(detect_firewall)
+    case "$_fw" in
+        iptables)
+            iptables -I INPUT -p "$_proto" --dport "$_port" -j ACCEPT ;;
+        nftables)
+            nft add table inet filter 2>/dev/null || true
+            nft add chain inet filter input \
+                '{ type filter hook input priority filter; policy accept; }' 2>/dev/null || true
+            nft add rule inet filter input "$_proto" dport "$_port" accept 2>/dev/null || true ;;
+    esac
+}
+
+# 持久化端口放行规则
+fw_persist_port() {
+    _proto="$1"; _port="$2"
+    _fw=$(detect_firewall)
+    if [ "$OS" = "alpine" ]; then
+        mkdir -p /etc/local.d
+        if [ "$_fw" = "iptables" ]; then
+            printf '#!/bin/sh\niptables -I INPUT -p %s --dport %s -j ACCEPT\n' \
+                "$_proto" "$_port" > /etc/local.d/openvpn-persist.start
+        else
+            cat > /etc/local.d/openvpn-persist.start << EOF
+#!/bin/sh
+nft add table inet filter 2>/dev/null || true
+nft add chain inet filter input '{ type filter hook input priority filter; policy accept; }' 2>/dev/null || true
+nft add rule inet filter input $_proto dport $_port accept 2>/dev/null || true
+EOF
+        fi
+        chmod +x /etc/local.d/openvpn-persist.start
+    else
+        if [ "$_fw" = "iptables" ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            msg_info "建议安装 iptables-persistent: apt install iptables-persistent"
+        else
+            nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+            systemctl enable nftables 2>/dev/null || true
+        fi
+    fi
+}
+
+# 允许 tun0 双向 FORWARD
+fw_allow_tun_forward() {
+    _fw=$(detect_firewall)
+    case "$_fw" in
+        iptables)
+            iptables -I FORWARD -i tun0 -o tun0 -j ACCEPT ;;
+        nftables)
+            nft add table inet filter 2>/dev/null || true
+            nft add chain inet filter forward \
+                '{ type filter hook forward priority filter; policy accept; }' 2>/dev/null || true
+            nft add rule inet filter forward iifname "tun0" oifname "tun0" accept 2>/dev/null || true ;;
+    esac
+}
+
+# 持久化 tun0 FORWARD 规则（输出每行命令，供写入持久化脚本）
+fw_persist_tun_lines() {
+    _fw=$(detect_firewall)
+    if [ "$_fw" = "iptables" ]; then
+        echo "iptables -I FORWARD -i tun0 -o tun0 -j ACCEPT"
+    else
+        echo "nft add table inet filter 2>/dev/null || true"
+        echo "nft add chain inet filter forward '{ type filter hook forward priority filter; policy accept; }' 2>/dev/null || true"
+        echo "nft add rule inet filter forward iifname tun0 oifname tun0 accept 2>/dev/null || true"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
 # 获取客户端列表函数
 # ─────────────────────────────────────────────────────────────
 get_client_list() {
@@ -61,11 +154,15 @@ get_client_list() {
             [ ! -f "$_crt_file" ] && continue
             _crt_name=$(basename "$_crt_file" .crt)
             [ "$_crt_name" = "server" ] && continue
-            CLIENTS="$CLIENTS $_crt_name"
+            if [ -z "$CLIENTS" ]; then
+                CLIENTS="$_crt_name"
+            else
+                CLIENTS="$CLIENTS
+$_crt_name"
+            fi
             CLIENT_COUNT=$((CLIENT_COUNT + 1))
         done
     fi
-    CLIENTS=$(echo "$CLIENTS" | sed 's/^ //')
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -79,7 +176,8 @@ select_client() {
         SELECTED_CLIENT=""
         return 1
     fi
-    set -- $CLIENTS
+    _OIFS="$IFS"; IFS='
+'; set -- $CLIENTS; IFS="$_OIFS"
     i=1
     while [ $# -gt 0 ]; do
         echo "  $i) $1"
@@ -88,14 +186,15 @@ select_client() {
     done
     echo ""
     printf "%s（1-%s，q返回）： " "$_prompt" "$((i - 1))"
-    read _sel
+    read -r _sel
     [ "$_sel" = "q" ] || [ "$_sel" = "Q" ] && { SELECTED_CLIENT=""; return 1; }
     if ! echo "$_sel" | grep -qE '^[0-9]+$' || [ "$_sel" -lt 1 ] || [ "$_sel" -ge "$i" ]; then
         msg_err "无效选择"
         SELECTED_CLIENT=""
         return 1
     fi
-    set -- $CLIENTS
+    _OIFS="$IFS"; IFS='
+'; set -- $CLIENTS; IFS="$_OIFS"
     j=1
     while [ "$j" -lt "$_sel" ]; do shift; j=$((j + 1)); done
     SELECTED_CLIENT="$1"
@@ -139,7 +238,7 @@ if [ -f /etc/alpine-release ]; then
     SERVICE_ENABLE="rc-update add openvpn default"
     SERVICE_DISABLE="rc-update del openvpn default"
     CONFIG_FILE="/etc/openvpn/openvpn.conf"
-    PERSIST_FILE="/etc/local.d/openvpn-nat.start"
+    PERSIST_FILE="/etc/local.d/openvpn-persist.start"
     EASYRSA_DIR="/etc/openvpn/easy-rsa"
     USE_SYSTEMD=0
 elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
@@ -147,7 +246,7 @@ elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null;
     PKG_INSTALL="apt install -y"
     PKG_REMOVE="apt purge -y"
     PKG_UPDATE="apt update"
-    PERSIST_FILE="/etc/iptables.rules.v4"
+    PERSIST_FILE="/etc/iptables/rules.v4"
     USE_SYSTEMD=1
 
     # 自动检测服务单元: openvpn-server@server (新版) vs openvpn@server (旧版)
@@ -304,6 +403,7 @@ if [ -f "$CONFIG_FILE" ]; then
                 msg_info "正在自动生成 CRL..."
                 _cwd=$(pwd)
                 cd "$EASYRSA_DIR"
+                export EASYRSA_BATCH=1
                 if ./easyrsa gen-crl 2>/dev/null; then
                     cp pki/crl.pem "$_crl_path" 2>/dev/null
                     chmod 644 "$_crl_path" 2>/dev/null
@@ -396,7 +496,7 @@ push "route 223.0.0.0 255.0.0.0 net_gateway"'
 if [ $# -gt 0 ]; then
     case "$1" in
         --add-client)
-            CLIENT_NAME="$2"
+            CLIENT_NAME=$(sanitize_name "$2")
             [ -z "$CLIENT_NAME" ] && { msg_err "用法: $0 --add-client NAME [--nopass] [--ip SERVER_IP]"; exit 1; }
             if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$CONFIG_FILE" ]; then
                 msg_err "服务端未安装"; exit 1
@@ -416,6 +516,7 @@ if [ $# -gt 0 ]; then
             [ -z "$SERVER_IP" ] && SERVER_IP=$(get_public_ipv4 || echo "YOUR_SERVER_IP")
             PORT=$(grep '^port ' "$CONFIG_FILE" | awk '{print $2}'); PORT=${PORT:-443}
             PROTO=$(grep '^proto ' "$CONFIG_FILE" | awk '{print $2}'); PROTO=${PROTO:-tcp}
+            export EASYRSA_BATCH=1
             ./easyrsa build-client-full "$CLIENT_NAME" $EXTRA
             CIPHER=$(grep '^cipher ' "$CONFIG_FILE" | awk '{print $2}'); CIPHER=${CIPHER:-AES-256-GCM}
             AUTH=$(grep '^auth ' "$CONFIG_FILE" | awk '{print $2}'); AUTH=${AUTH:-SHA512}
@@ -475,7 +576,8 @@ EOF
             CLIENT_NAME="$2"
             [ -z "$CLIENT_NAME" ] && { msg_err "用法: $0 --del-client NAME"; exit 1; }
             cd "$EASYRSA_DIR"
-            echo "yes" | ./easyrsa revoke "$CLIENT_NAME" 2>/dev/null || true
+            export EASYRSA_BATCH=1
+            ./easyrsa revoke "$CLIENT_NAME" 2>/dev/null || true
             ./easyrsa gen-crl
             cp pki/crl.pem /etc/openvpn/ 2>/dev/null || true
             rm -f "pki/issued/${CLIENT_NAME}.crt" "pki/private/${CLIENT_NAME}.key" \
@@ -486,7 +588,7 @@ EOF
             ;;
         --list-clients)
             get_client_list
-            if [ "$CLIENT_COUNT" -eq 0 ]; then echo "暂无客户端"; else echo "$CLIENTS" | tr ' ' '\n'; fi
+            if [ "$CLIENT_COUNT" -eq 0 ]; then echo "暂无客户端"; else printf '%s\n' $CLIENTS; fi
             exit 0
             ;;
         --status)
@@ -582,10 +684,11 @@ while true; do
         echo " ${CYAN}18)${RESET} 查看吊销证书列表"
         echo " ${CYAN}19)${RESET} 查看客户端流量统计"
         echo " ${CYAN}20)${RESET} 查看审计日志"
+        echo " ${YELLOW}22)${RESET} 设置出口网关客户端"
         echo " ${RED} 0)${RESET} 退出脚本"
         echo ""
-        printf "请选择操作（0~20，回车默认1）： "
-        read mode_choice
+        printf "请选择操作（0~20,22，回车默认1）： "
+        read -r mode_choice
         MODE=${mode_choice:-1}
     else
         echo "未检测到服务端配置，将引导安装。"
@@ -600,7 +703,7 @@ while true; do
     if [ "$MODE" = "1" ]; then
         if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$CONFIG_FILE" ]; then
             msg_err "服务端未正确安装，请先选择模式 5。"
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
 
         cd "$EASYRSA_DIR"
@@ -610,19 +713,21 @@ while true; do
         SERVER_IP=$(get_public_ipv4 || echo "YOUR_SERVER_IP")
 
         msg_info "读取配置：协议 $PROTO，端口 $PORT，服务器 IP $SERVER_IP"
-        printf "修改 IP？（回车保持）： "; read input_ip
+        printf "修改 IP？（回车保持）： "; read -r input_ip
         SERVER_IP=${input_ip:-$SERVER_IP}
 
-        printf "新客户端名称（例如 work、iphone14）： "; read CLIENT_NAME
+        printf "新客户端名称（例如 work、iphone14）： "; read -r CLIENT_NAME
+        CLIENT_NAME=$(sanitize_name "$CLIENT_NAME")
         if [ -z "$CLIENT_NAME" ]; then
             msg_err "必须输入名称"
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
 
         echo "1) 有密码   2) 无密码（nopass）"
-        printf "选择（回车2）： "; read pass_choice
+        printf "选择（回车2）： "; read -r pass_choice
         if [ "${pass_choice:-2}" = "1" ]; then EXTRA=""; else EXTRA="nopass"; fi
 
+        export EASYRSA_BATCH=1
         ./easyrsa build-client-full "$CLIENT_NAME" $EXTRA
 
         CIPHER=$(grep '^cipher ' "$CONFIG_FILE" | awk '{print $2}'); CIPHER=${CIPHER:-AES-256-GCM}
@@ -676,14 +781,14 @@ EOF
         msg_ok "客户端配置文件生成： $OVPN_FILE"
 
         printf "是否立即为 %s 配置（LAN、固定IP、push 等）？(y/n，回车 y)： " "$CLIENT_NAME"
-        read configure_now
+        read -r configure_now
         configure_now=${configure_now:-y}
 
         if [ "$configure_now" = "y" ] || [ "$configure_now" = "Y" ]; then
             AUTO_CLIENT_NAME="$CLIENT_NAME"
             MODE=3
         else
-            printf "按回车返回主菜单..."; read dummy; continue
+            printf "按回车返回主菜单..."; read -r dummy; continue
         fi
     fi
 
@@ -693,13 +798,13 @@ EOF
     if [ "$MODE" = "3" ]; then
         if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$CONFIG_FILE" ]; then
             msg_err "服务端未正确安装。"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         mkdir -p "$CCD_DIR"
         grep -q '^client-config-dir' "$CONFIG_FILE" || echo "client-config-dir $CCD_DIR" >> "$CONFIG_FILE"
         if ! grep -q '^client-to-client' "$CONFIG_FILE"; then
-            printf "是否启用 client-to-client？(y/n，回车 y)： "; read c2c
+            printf "是否启用 client-to-client？(y/n，回车 y)： "; read -r c2c
             [ "${c2c:-y}" = "y" ] && echo "client-to-client" >> "$CONFIG_FILE"
         fi
 
@@ -712,7 +817,7 @@ EOF
             AUTO_CLIENT_NAME=""
         else
             if ! select_client "请选择编号"; then
-                printf "按回车继续..."; read dummy; continue
+                printf "按回车继续..."; read -r dummy; continue
             fi
             CLIENT_NAME="$SELECTED_CLIENT"
             msg_info "已选择：$CLIENT_NAME"
@@ -727,15 +832,15 @@ EOF
         _vpn_prefix=$(echo "$_vpn_net" | sed 's/\.[0-9]*$//')
         _vpn_example="${_vpn_prefix}.88"
 
-        printf "固定 VPN IP（例如 %s，网段 %s/%s，回车跳过）： " "$_vpn_example" "$_vpn_net" "$_vpn_mask"; read FIXED_IP
+        printf "固定 VPN IP（例如 %s，网段 %s/%s，回车跳过）： " "$_vpn_example" "$_vpn_net" "$_vpn_mask"; read -r FIXED_IP
         FIXED_MASK="$_vpn_mask"
 
-        printf "客户端后面内网网段（例如 192.168.5.0，回车跳过）： "; read CLIENT_LAN_NET
+        printf "客户端后面内网网段（例如 192.168.5.0，回车跳过）： "; read -r CLIENT_LAN_NET
         CLIENT_LAN_MASK="255.255.255.0"
 
         echo ""
         echo "针对 $CLIENT_NAME 的推送配置："
-        printf "推送全局代理（redirect-gateway def1）？(y/n，回车 n)： "; read push_global
+        printf "推送全局代理（redirect-gateway def1）？(y/n，回车 n)： "; read -r push_global
         push_global=${push_global:-n}
 
         echo ""
@@ -743,7 +848,7 @@ EOF
         echo "  1) 使用默认列表（39条）"
         echo "  2) 手动输入"
         echo "  3) 不添加"
-        printf "选择（1~3，回车 3）： "; read bypass_choice
+        printf "选择（1~3，回车 3）： "; read -r bypass_choice
         bypass_choice=${bypass_choice:-3}
 
         BYPASS_PUSH=""
@@ -753,14 +858,14 @@ EOF
         elif [ "$bypass_choice" = "2" ]; then
             echo "请输入绕过段（格式：1.0.0.0 255.0.0.0，每行一个，空行结束）："
             while true; do
-                printf "> "; read line
+                printf "> "; read -r line
                 [ -z "$line" ] && break
                 BYPASS_PUSH="${BYPASS_PUSH}
 push \"route $line net_gateway\""
             done
         fi
 
-        printf "推送自定义 DNS（空格分隔，回车跳过）： "; read client_dns
+        printf "推送自定义 DNS（空格分隔，回车跳过）： "; read -r client_dns
         DNS_PUSH=""
         if [ -n "$client_dns" ]; then
             for dns in $client_dns; do
@@ -782,81 +887,13 @@ push \"dhcp-option DNS $dns\""
             echo "iroute $CLIENT_LAN_NET $CLIENT_LAN_MASK" >> "$CCD_FILE"
         fi
 
-        # 网关角色：是否让该客户端作为默认互联网出口
-        printf "是否将此客户端设为默认互联网出口网关（iroute 0.0.0.0，如 getway 角色）？(y/n，回车 n)： "; read is_gateway
-        is_gateway=${is_gateway:-n}
-        if [ "$is_gateway" = "y" ] || [ "$is_gateway" = "Y" ]; then
-            echo "iroute 0.0.0.0 0.0.0.0" >> "$CCD_FILE"
-
-            # 从 server.conf 读取 VPN 网段信息
-            _srv_net=$(grep '^server ' "$CONFIG_FILE" | awk '{print $2}')
-            _srv_mask=$(grep '^server ' "$CONFIG_FILE" | awk '{print $3}')
-            case "${_srv_mask:-255.255.255.0}" in
-                255.255.255.0) _srv_cidr="24" ;; 255.255.0.0) _srv_cidr="16" ;; *) _srv_cidr="24" ;;
-            esac
-
-            # 确保 mangle 标记规则存在
-            iptables -t mangle -C PREROUTING -i tun0 ! -d ${_srv_net}/${_srv_cidr} -j MARK --set-mark 0x100 2>/dev/null || \
-            iptables -t mangle -A PREROUTING -i tun0 ! -d ${_srv_net}/${_srv_cidr} -j MARK --set-mark 0x100
-
-            # 确保 ip rule 存在
-            ip rule add fwmark 0x100 lookup 100 priority 100 2>/dev/null || true
-
-            # 确保路由表已注册
-            if ! grep -q "^100 vpntunnel" /etc/iproute2/rt_tables 2>/dev/null; then
-                echo "100 vpntunnel" >> /etc/iproute2/rt_tables
-            fi
-
-            # 如果 tun0 已存在则立即生效
-            if ip link show tun0 >/dev/null 2>&1; then
-                ip route replace default via "$VPN_IP" dev tun0 table 100 2>/dev/null || true
-                msg_ok "策略路由已立即生效: table 100 default via $VPN_IP"
-            fi
-
-            # 更新 systemd override / Alpine local.d（持久化，重启后自动生效）
-            if [ "$OS" = "alpine" ]; then
-                cat > /etc/local.d/openvpn-policy-route.start << ALPEOF
-#!/bin/sh
-sleep 3
-ip route replace default via $VPN_IP dev tun0 table 100 2>/dev/null || true
-ALPEOF
-                cat > /etc/local.d/openvpn-policy-route.stop << ALPEOF
-#!/bin/sh
-ip route flush table 100 2>/dev/null || true
-ALPEOF
-                chmod +x /etc/local.d/openvpn-policy-route.start /etc/local.d/openvpn-policy-route.stop
-                msg_ok "Alpine 策略路由已更新: 网关 IP = $VPN_IP"
-            else
-                mkdir -p /etc/systemd/system/openvpn@server.service.d
-                cat > /etc/systemd/system/openvpn@server.service.d/policy-route.conf << SYSEOF
-[Service]
-ExecStartPost=-/bin/sh -c 'sleep 2; ip route replace default via $VPN_IP dev tun0 table 100 || true'
-ExecStopPost=-/bin/sh -c 'ip route flush table 100 || true'
-SYSEOF
-                systemctl daemon-reload
-                msg_ok "systemd override 已更新: 网关 IP = $VPN_IP"
-            fi
-
-            # 持久化 iptables
-            if [ "$OS" = "alpine" ]; then
-                # Alpine: 追加到持久化文件 (如果不存在)
-                if ! grep -q "mangle.*0x100" "$PERSIST_FILE" 2>/dev/null; then
-                    echo "iptables -t mangle -A PREROUTING -i tun0 ! -d ${_srv_net}/${_srv_cidr} -j MARK --set-mark 0x100" >> "$PERSIST_FILE"
-                    echo "ip rule add fwmark 0x100 lookup 100 priority 100 2>/dev/null || true" >> "$PERSIST_FILE"
-                fi
-            else
-                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            fi
-
-            msg_ok "已设为网关角色：所有其他客户端的海外流量将通过此客户端出去"
-            msg_info "安全策略路由: 仅 tun0 入站流量转发给网关，服务器自身流量不受影响"
-        fi
+        msg_info "如需将此客户端设为互联网出口网关，请使用菜单模式 22。"
 
         [ "$push_global" = "y" ] && echo "push \"redirect-gateway def1\"" >> "$CCD_FILE"
 
         # 如果启用了 redirect-gateway，询问是否推送内网路由
         if [ "$push_global" = "y" ]; then
-            printf "推送内网路由（如 192.168.5.0/24 走 VPN，确保内网可达）？(输入网段，回车跳过)： "; read push_lan
+            printf "推送内网路由（如 192.168.5.0/24 走 VPN，确保内网可达）？(输入网段，回车跳过)： "; read -r push_lan
             if [ -n "$push_lan" ]; then
                 echo "push \"route $push_lan 255.255.255.0 vpn_gateway\"" >> "$CCD_FILE"
                 msg_ok "已添加内网路由推送: $push_lan/24 via vpn_gateway"
@@ -872,7 +909,7 @@ SYSEOF
         cat "$CCD_FILE"
         echo ""
         msg_info "执行：$SERVICE_RESTART"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -881,37 +918,32 @@ SYSEOF
     if [ "$MODE" = "2" ]; then
         if [ ! -f "$CONFIG_FILE" ]; then
             msg_err "服务端未安装，请先选择模式 5。"
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
 
         PORT=$(grep '^port ' "$CONFIG_FILE" | awk '{print $2}'); PORT=${PORT:-443}
         PROTO=$(grep '^proto ' "$CONFIG_FILE" | awk '{print $2}'); PROTO=${PROTO:-tcp}
         msg_info "当前监听端口：${PROTO} $PORT"
 
-        printf "是否自动放行端口？输入 YES 确认： "; read confirm
+        printf "是否自动放行端口？输入 YES 确认： "; read -r confirm
         if [ "$confirm" = "YES" ]; then
-            iptables -I INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT
-
-            if [ "$OS" = "alpine" ]; then
-                mkdir -p /etc/local.d
-                cat > /etc/local.d/openvpn-firewall.start << EOF
-iptables -I INPUT -p $PROTO --dport $PORT -j ACCEPT
-EOF
-                chmod +x /etc/local.d/openvpn-firewall.start
-            elif [ "$OS" = "debian" ]; then
-                msg_info "建议安装 iptables-persistent 并运行 netfilter-persistent save"
-            fi
-
+            fw_allow_port "$PROTO" "$PORT"
+            fw_persist_port "$PROTO" "$PORT"
             audit "放行端口: $PROTO $PORT"
             msg_ok "端口已放行。"
         fi
 
         echo ""
         echo "当前 INPUT 链相关规则："
-        iptables -L INPUT -v -n | grep "$PORT" || echo "未找到相关规则"
+        _fw2=$(detect_firewall)
+        if [ "$_fw2" = "iptables" ]; then
+            iptables -L INPUT -v -n | grep "$PORT" || echo "未找到相关规则"
+        else
+            nft list ruleset | grep "$PORT" || echo "未找到相关规则"
+        fi
         msg_warn "云厂商安全组仍需手动放行 ${PROTO} $PORT"
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -920,20 +952,20 @@ EOF
     if [ "$MODE" = "4" ]; then
         if [ ! -f "$CONFIG_FILE" ]; then
             msg_err "服务端未安装。"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         echo "${BOLD}=== 全局配置修改（影响所有客户端）===${RESET}"
         echo ""
 
-        printf "是否修改中国IP绕过列表？(y/n)： "; read add_bypass
+        printf "是否修改中国IP绕过列表？(y/n)： "; read -r add_bypass
         if [ "$add_bypass" = "y" ] || [ "$add_bypass" = "Y" ]; then
             echo ""
             echo "1) 使用默认列表（39条）"
             echo "2) 手动输入新列表（清空旧的）"
             echo "3) 追加到现有"
             echo "4) 跳过"
-            printf "选择（1~4，回车1）： "; read ch
+            printf "选择（1~4，回车1）： "; read -r ch
             ch=${ch:-1}
 
             case $ch in
@@ -946,7 +978,7 @@ EOF
                     sed_inplace '/^push "route .* net_gateway"/d' "$CONFIG_FILE"
                     echo "请输入新段（格式 1.0.0.0 255.0.0.0，每行一个，空行结束）："
                     while true; do
-                        printf "> "; read line
+                        printf "> "; read -r line
                         [ -z "$line" ] && break
                         echo "push \"route $line net_gateway\"" >> "$CONFIG_FILE"
                     done
@@ -954,7 +986,7 @@ EOF
                 3)
                     echo "请输入追加段（同上格式）："
                     while true; do
-                        printf "> "; read line
+                        printf "> "; read -r line
                         [ -z "$line" ] && break
                         echo "push \"route $line net_gateway\"" >> "$CONFIG_FILE"
                     done
@@ -963,16 +995,16 @@ EOF
             esac
         fi
 
-        printf "是否更新全局 DNS push？(y/n)： "; read dns_yn
+        printf "是否更新全局 DNS push？(y/n)： "; read -r dns_yn
         if [ "$dns_yn" = "y" ] || [ "$dns_yn" = "Y" ]; then
-            printf "输入 DNS（空格分隔，例如 114.114.114.114 8.8.8.8）： "; read dns_list
+            printf "输入 DNS（空格分隔，例如 114.114.114.114 8.8.8.8）： "; read -r dns_list
             if [ -n "$dns_list" ]; then
                 sed_inplace '/^push "dhcp-option DNS /d' "$CONFIG_FILE"
                 for dns in $dns_list; do echo "push \"dhcp-option DNS $dns\"" >> "$CONFIG_FILE"; done
             fi
         fi
 
-        printf "是否添加/更新全局 LAN route/push（例如 192.168.1.0/24，回车跳过）： "; read lan
+        printf "是否添加/更新全局 LAN route/push（例如 192.168.1.0/24，回车跳过）： "; read -r lan
         if [ -n "$lan" ]; then
             net=$(echo "$lan" | cut -d/ -f1)
             mask="255.255.255.0"
@@ -984,7 +1016,7 @@ EOF
 
         audit "全局配置修改"
         msg_ok "全局配置更新完成。建议执行：$SERVICE_RESTART"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -999,7 +1031,7 @@ EOF
         echo "协议选择："
         echo "1) TCP（更稳定，穿透性强）"
         echo "2) UDP（性能更好，延迟更低）"
-        printf "选择（1~2，回车1）： "; read proto_choice
+        printf "选择（1~2，回车1）： "; read -r proto_choice
         if [ "${proto_choice:-1}" = "2" ]; then
             PROTO="udp"
         else
@@ -1007,11 +1039,11 @@ EOF
         fi
 
         PORT=443
-        printf "监听端口（默认 443）： "; read p
+        printf "监听端口（默认 443）： "; read -r p
         PORT=${p:-443}
 
         VPN_NET="10.8.0.0"
-        printf "VPN 网段（默认 10.8.0.0）： "; read n
+        printf "VPN 网段（默认 10.8.0.0）： "; read -r n
         VPN_NET=${n:-10.8.0.0}
 
         # ── 子网掩码选择 ──
@@ -1020,10 +1052,10 @@ EOF
         echo "1) 255.255.255.0  (/24 - 最多254客户端)"
         echo "2) 255.255.0.0    (/16 - 最多65534客户端)"
         echo "3) 自定义"
-        printf "选择（1~3，回车1）： "; read mask_choice
+        printf "选择（1~3，回车1）： "; read -r mask_choice
         case "${mask_choice:-1}" in
             2) VPN_MASK="255.255.0.0" ;;
-            3) printf "输入子网掩码: "; read VPN_MASK; VPN_MASK=${VPN_MASK:-255.255.255.0} ;;
+            3) printf "输入子网掩码: "; read -r VPN_MASK; VPN_MASK=${VPN_MASK:-255.255.255.0} ;;
             *) VPN_MASK="255.255.255.0" ;;
         esac
 
@@ -1034,7 +1066,7 @@ EOF
         echo "3) AES-128-GCM + SHA256"
         echo "4) CHACHA20-POLY1305 + SHA256"
         echo "5) 无加密（仅测试！）"
-        printf "选择（1~5，回车2）： "; read enc
+        printf "选择（1~5，回车2）： "; read -r enc
         enc=${enc:-2}
 
         case "$enc" in
@@ -1044,7 +1076,7 @@ EOF
             4) CIPHER="CHACHA20-POLY1305"; AUTH="SHA256"; TLS_MIN="1.2" ;;
             5)
                 msg_warn "无加密模式！数据明文传输。"
-                printf "输入 YES 确认： "; read confirm
+                printf "输入 YES 确认： "; read -r confirm
                 [ "$confirm" != "YES" ] && continue
                 CIPHER="none"; AUTH="none"; TLS_MIN="1.2"
                 ;;
@@ -1085,8 +1117,9 @@ set_var EASYRSA_CA_EXPIRE      3650
 set_var EASYRSA_CERT_EXPIRE    3650
 EOF
 
+        export EASYRSA_BATCH=1
         ./easyrsa init-pki
-        echo "yes" | ./easyrsa build-ca nopass
+        ./easyrsa build-ca nopass
         ./easyrsa gen-dh
         ./easyrsa build-server-full server nopass
         openvpn --genkey secret ta.key
@@ -1099,7 +1132,7 @@ EOF
         # 获取公网 IPv4
         SERVER_IP=$(get_public_ipv4)
         if [ -z "$SERVER_IP" ]; then
-            printf "无法自动获取公网 IPv4，请手动输入： "; read SERVER_IP
+            printf "无法自动获取公网 IPv4，请手动输入： "; read -r SERVER_IP
         fi
         msg_info "服务器公网 IP: $SERVER_IP"
 
@@ -1163,68 +1196,44 @@ EOF
         # 所有海外/互联网流量通过 tun0 转发给网关客户端 (getway)
         # getway 负责 NAT 出口到互联网和内网
 
-        # NAT: VPN客户端互访经由客户端后面的子网（如通过 iroute 暴露的内网）
-        # 使远端子网看到的源IP是其网关的内网IP，解决 DNS/服务 访问控制问题
-        iptables -t nat -A POSTROUTING -s "${VPN_NET}/${VPN_CIDR}" -o tun0 -j MASQUERADE
-        # FORWARD: tun0 内部双向转发（mobile/work <-> getway）
-        iptables -I FORWARD -i tun0 -o tun0 -j ACCEPT
-        # mangle: 标记 tun0 入站、目标非 VPN 子网的包 (用于策略路由)
-        iptables -t mangle -A PREROUTING -i tun0 ! -d ${VPN_NET}/${VPN_CIDR} -j MARK --set-mark 0x100
+        # FORWARD: tun0 内部双向转发（自动适配 iptables/nftables）
+        fw_allow_tun_forward
 
-        # 策略路由: 注册自定义路由表
-        TABLE_ID=100
-        if ! grep -q "^${TABLE_ID} vpntunnel" /etc/iproute2/rt_tables 2>/dev/null; then
-            echo "${TABLE_ID} vpntunnel" >> /etc/iproute2/rt_tables
+        # 开启内核 IP 转发（整个转发架构的基础）
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || \
+            echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+        sysctl -p 2>/dev/null || true
+        msg_ok "IP 转发已开启"
+
+        # 注册策略路由表（供模式 22 出口网关配置使用）
+        if ! grep -q "^100 vpntunnel" /etc/iproute2/rt_tables 2>/dev/null; then
+            echo "100 vpntunnel" >> /etc/iproute2/rt_tables
         fi
-        ip rule add fwmark 0x100 lookup $TABLE_ID priority 100 2>/dev/null || true
-        msg_info "策略路由规则已添加 (fwmark 0x100 → table vpntunnel)"
 
-        # 询问网关客户端的 VPN IP（用于策略路由）
-        echo ""
-        printf "输入网关客户端 (getway) 的 VPN IP (回车默认 172.27.0.5)： "; read GATEWAY_CLIENT_IP
-        GATEWAY_CLIENT_IP=${GATEWAY_CLIENT_IP:-172.27.0.5}
-        msg_info "网关客户端 IP: $GATEWAY_CLIENT_IP"
-
-        # 持久化
+        # 持久化防火墙规则（自动适配 iptables/nftables）
+        _fw5=$(detect_firewall)
         if [ "$OS" = "alpine" ]; then
-            cat > "$PERSIST_FILE" << EOF
-#!/bin/sh
-iptables -t nat -A POSTROUTING -s ${VPN_NET}/${VPN_CIDR} -o tun0 -j MASQUERADE
-iptables -I FORWARD -i tun0 -o tun0 -j ACCEPT
-iptables -t mangle -A PREROUTING -i tun0 ! -d ${VPN_NET}/${VPN_CIDR} -j MARK --set-mark 0x100
-iptables -I INPUT -p $PROTO --dport $PORT -j ACCEPT
-ip rule add fwmark 0x100 lookup 100 priority 100 2>/dev/null || true
-EOF
+            {
+                echo "#!/bin/sh"
+                fw_persist_tun_lines
+                if [ "$_fw5" = "iptables" ]; then
+                    echo "iptables -I INPUT -p $PROTO --dport $PORT -j ACCEPT"
+                else
+                    echo "nft add table inet filter 2>/dev/null || true"
+                    echo "nft add chain inet filter input '{ type filter hook input priority filter; policy accept; }' 2>/dev/null || true"
+                    echo "nft add rule inet filter input $PROTO dport $PORT accept 2>/dev/null || true"
+                fi
+            } > "$PERSIST_FILE"
             chmod +x "$PERSIST_FILE"
-            # Alpine: 用 local.d 脚本在 OpenVPN 启动后添加路由表条目
-            cat > /etc/local.d/openvpn-policy-route.start << ALPEOF
-#!/bin/sh
-# 等待 tun0 就绪后添加策略路由表条目
-sleep 3
-ip route replace default via $GATEWAY_CLIENT_IP dev tun0 table 100 2>/dev/null || true
-ALPEOF
-            cat > /etc/local.d/openvpn-policy-route.stop << ALPEOF
-#!/bin/sh
-ip route flush table 100 2>/dev/null || true
-ALPEOF
-            chmod +x /etc/local.d/openvpn-policy-route.start /etc/local.d/openvpn-policy-route.stop
-            msg_info "Alpine 策略路由启停脚本已写入 /etc/local.d/"
+            msg_info "Alpine 防火墙持久化已写入 $PERSIST_FILE"
         else
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            msg_info "已保存 iptables 规则到 /etc/iptables/rules.v4"
-
-            # Debian/Ubuntu: 用 systemd override 在 OpenVPN 启停时管理路由表条目
-            # ExecStartPost: 等待 tun0 就绪后添加路由表默认网关指向 getway
-            # ExecStopPost:  清理路由表
-            # 注意: 必须用 -/bin/sh -c 包装，前缀 - 表示忽略失败（防止杀死主进程）
-            mkdir -p /etc/systemd/system/openvpn@server.service.d
-            cat > /etc/systemd/system/openvpn@server.service.d/policy-route.conf << SYSEOF
-[Service]
-ExecStartPost=-/bin/sh -c 'sleep 2; ip route replace default via $GATEWAY_CLIENT_IP dev tun0 table 100 || true'
-ExecStopPost=-/bin/sh -c 'ip route flush table 100 || true'
-SYSEOF
-            systemctl daemon-reload
-            msg_info "systemd override 已创建: ExecStartPost/ExecStopPost 管理策略路由"
+            if [ "$_fw5" = "iptables" ]; then
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            else
+                nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+                systemctl enable nftables 2>/dev/null || true
+            fi
         fi
 
         $SERVICE_ENABLE 2>/dev/null || true
@@ -1234,9 +1243,235 @@ SYSEOF
         echo ""
         msg_ok "服务端安装完成。"
         msg_info "协议：$PROTO  端口：$PORT  IP：$SERVER_IP  网段：$VPN_NET/$VPN_MASK"
-        msg_info "配置文件：$CONFIG_FILE"
+        msg_info "配置文件：$CONFIG_FILE  防火墙后端：$_fw5"
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        msg_warn "出口网关尚未配置，安装完成客户端证书后请使用【模式 22】设置出口网关。"
+        echo ""
+        printf "按回车返回主菜单..."; read -r dummy; continue
+    fi
+
+    # ─────────────────────────────────────────────────────────────
+    # 模式22：设置出口网关客户端
+    # ─────────────────────────────────────────────────────────────
+    if [ "$MODE" = "22" ]; then
+        if [ ! -f "$CONFIG_FILE" ]; then
+            msg_err "服务端未安装，请先选择模式 5。"
+            printf "按回车继续..."; read -r dummy; continue
+        fi
+
+        _gw_state="/etc/openvpn/gateway-client.conf"
+        _fw22=$(detect_firewall)
+
+        # 读取当前状态
+        _cur_gw_name=""
+        _cur_gw_ip=""
+        _cur_gw_net=""
+        _cur_gw_cidr=""
+        if [ -f "$_gw_state" ]; then
+            _cur_gw_name=$(grep '^GATEWAY_CLIENT=' "$_gw_state" | cut -d= -f2)
+            _cur_gw_ip=$(grep '^GATEWAY_IP=' "$_gw_state" | cut -d= -f2)
+            _cur_gw_net=$(grep '^VPN_NET=' "$_gw_state" | cut -d= -f2)
+            _cur_gw_cidr=$(grep '^VPN_CIDR=' "$_gw_state" | cut -d= -f2)
+        fi
+
+        echo "${BOLD}=== 出口网关客户端配置 ===${RESET}"
+        echo ""
+        if [ -n "$_cur_gw_name" ]; then
+            msg_ok "当前出口网关: ${BOLD}$_cur_gw_name${RESET} (VPN IP: $_cur_gw_ip)"
+        else
+            msg_warn "当前未设置出口网关"
+        fi
+        echo ""
+        echo "  1) 设置/更换出口网关客户端"
+        echo "  2) 清除出口网关配置"
+        echo "  3) 查看当前路由规则状态"
+        echo "  0) 返回主菜单"
+        printf "选择（回车 1）： "; read -r _gw_act
+        _gw_act=${_gw_act:-1}
+
+        # ── 查看状态 ──────────────────────────────────────────
+        if [ "$_gw_act" = "3" ]; then
+            echo ""
+            echo "=== ip rule show ==="
+            ip rule show
+            echo ""
+            echo "=== ip route show table 100 ==="
+            ip route show table 100 2>/dev/null || echo "(空)"
+            echo ""
+            if [ "$_fw22" = "iptables" ]; then
+                echo "=== iptables FORWARD ==="
+                iptables -L FORWARD -v -n 2>/dev/null || true
+            else
+                echo "=== nft filter forward ==="
+                nft list chain inet filter forward 2>/dev/null || echo "(无 nftables forward 链)"
+            fi
+            printf "\n按回车返回主菜单..."; read -r dummy; continue
+        fi
+
+        # ── 清除 ──────────────────────────────────────────────
+        if [ "$_gw_act" = "2" ]; then
+            if [ -z "$_cur_gw_ip" ]; then
+                msg_warn "未找到已配置的出口网关，无需清除。"
+                printf "按回车继续..."; read -r dummy; continue
+            fi
+            ip route flush table 100 2>/dev/null || true
+            ip rule del from ${_cur_gw_ip}/32 lookup main priority 99 2>/dev/null || true
+            ip rule del from ${_cur_gw_net}/${_cur_gw_cidr} lookup 100 priority 100 2>/dev/null || true
+            # 清除 CCD iroute 0.0.0.0
+            _ccd22="$CCD_DIR/$_cur_gw_name"
+            [ -f "$_ccd22" ] && sed_inplace '/^iroute 0\.0\.0\.0/d' "$_ccd22"
+            # 清除持久化脚本
+            if [ "$OS" = "alpine" ]; then
+                rm -f /etc/local.d/openvpn-policy-route.start /etc/local.d/openvpn-policy-route.stop
+            else
+                rm -f "/etc/systemd/system/${SVC_UNIT}.service.d/policy-route.conf"
+                systemctl daemon-reload 2>/dev/null || true
+            fi
+            rm -f "$_gw_state"
+            msg_ok "出口网关配置已清除，正在重启 OpenVPN..."
+            $SERVICE_RESTART 2>/dev/null || true
+            audit "清除出口网关: $_cur_gw_name"
+            printf "按回车返回主菜单..."; read -r dummy; continue
+        fi
+
+        [ "$_gw_act" != "1" ] && continue
+
+        # ── 设置网关 ──────────────────────────────────────────
+        echo ""
+        if ! select_client "请选择要作为出口网关的客户端"; then
+            printf "按回车继续..."; read -r dummy; continue
+        fi
+        _gw_name="$SELECTED_CLIENT"
+        _gw_ccd="$CCD_DIR/$_gw_name"
+
+        # 读取 VPN 网段
+        _srv_net=$(grep '^server ' "$CONFIG_FILE" | awk '{print $2}')
+        _srv_mask=$(grep '^server ' "$CONFIG_FILE" | awk '{print $3}')
+        case "${_srv_mask:-255.255.255.0}" in
+            255.255.255.0) _srv_cidr="24" ;; 255.255.0.0) _srv_cidr="16" ;; *) _srv_cidr="24" ;;
+        esac
+
+        # 确定网关的 VPN IP
+        _gw_ip_hint=$(grep '^ifconfig-push ' "$_gw_ccd" 2>/dev/null | awk '{print $2}')
+        _default_gw_ip=${_gw_ip_hint:-${_srv_net%.*}.5}
+        if [ -n "$_gw_ip_hint" ]; then
+            printf "网关 VPN IP（检测到固定 IP %s，回车使用）： " "$_gw_ip_hint"; read -r _gw_ip_in
+        else
+            printf "网关客户端 VPN IP（回车默认 %s）： " "$_default_gw_ip"; read -r _gw_ip_in
+        fi
+        _gw_ip=${_gw_ip_in:-$_default_gw_ip}
+
+        # 可选：G 和 C 的局域网信息（用于生成说明）
+        echo ""
+        msg_info "以下信息用于生成 G（局域网网关）配置命令，可跳过（回车跳过）"
+        printf "局域网网关 G 的 IP（如 192.168.5.4）： "; read -r _g_ip
+        printf "网关客户端 C 的局域网 IP（如 192.168.5.5）： "; read -r _c_lan_ip
+        printf "G 的上行网卡（如 eth0）： "; read -r _g_iface
+
+        # 1. 更新 CCD：加入 iroute 0.0.0.0 0.0.0.0
+        mkdir -p "$CCD_DIR"
+        [ ! -f "$_gw_ccd" ] && touch "$_gw_ccd"
+        grep -q '^iroute 0\.0\.0\.0' "$_gw_ccd" 2>/dev/null || \
+            echo "iroute 0.0.0.0 0.0.0.0" >> "$_gw_ccd"
+
+        # 2. 确保 vpntunnel 路由表已注册
+        grep -q "^100 vpntunnel" /etc/iproute2/rt_tables 2>/dev/null || \
+            echo "100 vpntunnel" >> /etc/iproute2/rt_tables
+
+        # 3. 应用策略路由规则
+        ip rule add from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true
+        ip rule add from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true
+        if ip link show tun0 >/dev/null 2>&1; then
+            ip route replace default via "$_gw_ip" dev tun0 table 100 2>/dev/null || true
+            msg_ok "策略路由已立即生效: default via $_gw_ip (table 100)"
+        fi
+
+        # 4. 持久化策略路由
+        if [ "$OS" = "alpine" ]; then
+            cat > /etc/local.d/openvpn-policy-route.start << ALPEOF
+#!/bin/sh
+sleep 3
+ip rule add from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true
+ip rule add from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true
+ip route replace default via $_gw_ip dev tun0 table 100 2>/dev/null || true
+ALPEOF
+            cat > /etc/local.d/openvpn-policy-route.stop << ALPEOF
+#!/bin/sh
+ip route flush table 100 2>/dev/null || true
+ip rule del from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true
+ip rule del from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true
+ALPEOF
+            chmod +x /etc/local.d/openvpn-policy-route.start /etc/local.d/openvpn-policy-route.stop
+            msg_ok "Alpine 策略路由持久化已写入 /etc/local.d/"
+        else
+            mkdir -p "/etc/systemd/system/${SVC_UNIT}.service.d"
+            cat > "/etc/systemd/system/${SVC_UNIT}.service.d/policy-route.conf" << SYSEOF
+[Service]
+ExecStartPost=-/bin/sh -c 'sleep 2; ip rule add from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true; ip rule add from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true; ip route replace default via $_gw_ip dev tun0 table 100 || true'
+ExecStopPost=-/bin/sh -c 'ip route flush table 100 || true; ip rule del from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true; ip rule del from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true'
+SYSEOF
+            systemctl daemon-reload
+            msg_ok "systemd override 已更新: 网关 IP = $_gw_ip (${SVC_UNIT})"
+        fi
+
+        # 5. 保存当前网关状态
+        cat > "$_gw_state" << GWEOF
+GATEWAY_CLIENT=$_gw_name
+GATEWAY_IP=$_gw_ip
+VPN_NET=$_srv_net
+VPN_CIDR=$_srv_cidr
+GWEOF
+
+        # 6. 重启 OpenVPN 使 iroute 0.0.0.0 生效
+        msg_info "正在重启 OpenVPN..."
+        $SERVICE_RESTART 2>/dev/null || true
+        audit "设置出口网关: $_gw_name VPN_IP=$_gw_ip"
+
+        # 7. 输出配置说明
+        echo ""
+        msg_ok "出口网关已配置: ${BOLD}$_gw_name${RESET} (VPN IP: $_gw_ip)"
+        echo ""
+        msg_info "═══ 在以下机器上执行配置 ═══"
+        echo ""
+        msg_info "【C - 网关客户端 VPN IP: $_gw_ip】"
+        msg_info "  只需开启 IP 转发，不做 MASQUERADE："
+        msg_info "    sysctl -w net.ipv4.ip_forward=1"
+        msg_info "    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf"
+        echo ""
+        if [ -n "$_g_ip" ] && [ -n "$_c_lan_ip" ] && [ -n "$_g_iface" ]; then
+            msg_info "【G - 局域网网关: $_g_ip】"
+            msg_info "  1. 添加回程路由："
+            msg_info "       ip route add ${_srv_net}/${_srv_cidr} via ${_c_lan_ip}"
+            echo ""
+            msg_info "  2. 添加出口 NAT（G 日志可见真实 VPN IP）："
+            if [ "$_fw22" = "iptables" ]; then
+                msg_info "     iptables 方式："
+                msg_info "       iptables -t nat -A POSTROUTING -s ${_srv_net}/${_srv_cidr} -o ${_g_iface} -j MASQUERADE"
+                msg_info "       iptables-save > /etc/iptables/rules.v4"
+            else
+                msg_info "     nftables 方式："
+                msg_info "       nft add table ip nat"
+                msg_info "       nft add chain ip nat POSTROUTING '{ type nat hook postrouting priority 100; }'"
+                msg_info "       nft add rule ip nat POSTROUTING ip saddr ${_srv_net}/${_srv_cidr} oifname \"${_g_iface}\" masquerade"
+                msg_info "       nft list ruleset > /etc/nftables.conf && systemctl enable nftables"
+            fi
+        else
+            msg_info "【G - 局域网网关】（未提供 G 的信息，使用通用命令模板）"
+            msg_info "  1. ip route add ${_srv_net}/${_srv_cidr} via <C的局域网IP>"
+            echo ""
+            msg_info "  2a. iptables 方式："
+            msg_info "       iptables -t nat -A POSTROUTING -s ${_srv_net}/${_srv_cidr} -o <上行网卡> -j MASQUERADE"
+            echo ""
+            msg_info "  2b. nftables 方式："
+            msg_info "       nft add table ip nat"
+            msg_info "       nft add chain ip nat POSTROUTING '{ type nat hook postrouting priority 100; }'"
+            msg_info "       nft add rule ip nat POSTROUTING ip saddr ${_srv_net}/${_srv_cidr} oifname \"<上行网卡>\" masquerade"
+            msg_info "       nft list ruleset > /etc/nftables.conf && systemctl enable nftables"
+        fi
+        echo ""
+        msg_warn "C 上不要配置任何 MASQUERADE，否则 G 无法看到真实 VPN IP！"
+        echo ""
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1245,7 +1480,7 @@ SYSEOF
     if [ "$MODE" = "6" ]; then
         echo "${BOLD}=== 卸载 OpenVPN ===${RESET}"
         msg_warn "这将删除所有证书、配置、规则等！"
-        printf "输入 YES 确认卸载： "; read confirm
+        printf "输入 YES 确认卸载： "; read -r confirm
         [ "$confirm" != "YES" ] && continue
 
         $SERVICE_STOP 2>/dev/null || true
@@ -1262,17 +1497,22 @@ SYSEOF
         esac
         iptables -t nat -D POSTROUTING -s "${UNINSTALL_VPN_NET}/${_cidr}" -j MASQUERADE 2>/dev/null || true
         # 清理策略路由相关规则
-        iptables -t nat -D POSTROUTING -s "${UNINSTALL_VPN_NET}/${_cidr}" -o tun0 -j MASQUERADE 2>/dev/null || true
-        iptables -t mangle -D PREROUTING -i tun0 ! -d ${UNINSTALL_VPN_NET}/${_cidr} -j MARK --set-mark 0x100 2>/dev/null || true
         iptables -D FORWARD -i tun0 -o tun0 -j ACCEPT 2>/dev/null || true
-        ip rule del fwmark 0x100 lookup 100 2>/dev/null || true
+        # 删除网关客户端 /32 防回路规则（精确匹配：priority 99 + /32 + lookup main，避免误删用户其他规则）
+        ip rule show priority 99 2>/dev/null | awk '/lookup main/ && /\/32/' | awk '{print $3}' | \
+            while read -r _gw32; do
+                ip rule del from "$_gw32" lookup main priority 99 2>/dev/null || true
+            done
+        # 删除 VPN 网段路由规则
+        ip rule del from ${UNINSTALL_VPN_NET}/${_cidr} lookup 100 2>/dev/null || true
         ip route flush table 100 2>/dev/null || true
-        sed -i '/^100 vpntunnel$/d' /etc/iproute2/rt_tables 2>/dev/null || true
+        sed_inplace '/^100 vpntunnel$/d' /etc/iproute2/rt_tables 2>/dev/null || true
 
         # 清理 systemd override / Alpine local.d
         rm -rf /etc/systemd/system/openvpn@server.service.d 2>/dev/null || true
+        rm -rf /etc/systemd/system/openvpn-server@server.service.d 2>/dev/null || true
         systemctl daemon-reload 2>/dev/null || true
-        rm -f /etc/local.d/openvpn-policy-route.start /etc/local.d/openvpn-policy-route.stop 2>/dev/null || true
+        rm -f /etc/local.d/openvpn-*.start /etc/local.d/openvpn-*.stop 2>/dev/null || true
 
         rm -rf /etc/openvpn/* 2>/dev/null || true
         rm -rf "$EASYRSA_DIR" 2>/dev/null || true
@@ -1286,7 +1526,7 @@ SYSEOF
 
         audit "卸载 OpenVPN"
         msg_ok "卸载完成。"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1295,23 +1535,24 @@ SYSEOF
     if [ "$MODE" = "7" ]; then
         if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$CONFIG_FILE" ]; then
             msg_err "服务端未正确安装。"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         echo ""
         echo "当前客户端证书列表："
         if ! select_client "要删除的客户端编号"; then
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
         DEL_CLIENT="$SELECTED_CLIENT"
         msg_warn "将删除客户端：$DEL_CLIENT"
 
-        printf "确认删除 %s？(y/n，回车 n)： " "$DEL_CLIENT"; read del_confirm
+        printf "确认删除 %s？(y/n，回车 n)： " "$DEL_CLIENT"; read -r del_confirm
         del_confirm=${del_confirm:-n}
         if [ "$del_confirm" != "y" ] && [ "$del_confirm" != "Y" ]; then continue; fi
 
         cd "$EASYRSA_DIR"
-        echo "yes" | ./easyrsa revoke "$DEL_CLIENT" 2>/dev/null || echo "撤销失败（可能已撤销）"
+        export EASYRSA_BATCH=1
+        ./easyrsa revoke "$DEL_CLIENT" 2>/dev/null || echo "撤销失败（可能已撤销）"
         ./easyrsa gen-crl
         cp pki/crl.pem /etc/openvpn/ 2>/dev/null || true
         rm -f "pki/issued/${DEL_CLIENT}.crt" "pki/private/${DEL_CLIENT}.key" \
@@ -1319,7 +1560,7 @@ SYSEOF
 
         audit "删除客户端: $DEL_CLIENT"
         msg_ok "已删除 $DEL_CLIENT。CRL 已更新。建议执行：$SERVICE_RESTART"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1340,7 +1581,7 @@ SYSEOF
                     msg_info "查看日志: cat /var/log/openvpn/openvpn.log"
                 fi
             else
-                if systemctl is-active --quiet openvpn@server; then
+                if systemctl is-active --quiet "$SVC_UNIT"; then
                     audit "重启服务: 成功"
                     msg_ok "服务已重启。"
                 else
@@ -1348,7 +1589,7 @@ SYSEOF
                     msg_err "服务重启后未正常运行！"
                     echo ""
                     msg_info "错误详情："
-                    journalctl -u openvpn@server --no-pager -n 20 2>/dev/null | tail -20
+                    journalctl -u "$SVC_UNIT" --no-pager -n 20 2>/dev/null | tail -20
                     echo ""
                     msg_info "配置检查："
                     openvpn --config "$CONFIG_FILE" --verb 0 2>&1 | head -5 || true
@@ -1360,10 +1601,10 @@ SYSEOF
             if [ "$OS" != "alpine" ]; then
                 echo ""
                 msg_info "错误详情："
-                journalctl -u openvpn@server --no-pager -n 20 2>/dev/null | tail -20
+                journalctl -u "$SVC_UNIT" --no-pager -n 20 2>/dev/null | tail -20
             fi
         fi
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1378,7 +1619,7 @@ SYSEOF
         if [ "$OS" = "alpine" ]; then
             rc-service openvpn status >/dev/null 2>&1 && _still_running=1
         else
-            systemctl is-active --quiet openvpn@server && _still_running=1
+            systemctl is-active --quiet "$SVC_UNIT" && _still_running=1
         fi
         if [ "$_still_running" -eq 1 ]; then
             msg_warn "服务仍在运行，尝试强制停止..."
@@ -1387,7 +1628,7 @@ SYSEOF
         fi
         audit "停止服务"
         msg_ok "服务已停止。"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1397,7 +1638,7 @@ SYSEOF
         $SERVICE_ENABLE
         audit "设置开机启动"
         msg_ok "已设置开机启动。"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1407,7 +1648,7 @@ SYSEOF
         $SERVICE_DISABLE
         audit "关闭开机启动"
         msg_ok "已关闭开机启动。"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1421,6 +1662,8 @@ SYSEOF
             msg_warn "暂无客户端"
         else
             _idx=1
+            _OIFS="$IFS"; IFS='
+'
             for _c in $CLIENTS; do
                 _status="${GREEN}有效${RESET}"
                 # 检查是否已吊销
@@ -1436,11 +1679,12 @@ SYSEOF
                 printf "  %2d) %-20s %b%s%s\n" "$_idx" "$_c" "$_status" "$_has_ccd" "$_has_ovpn"
                 _idx=$((_idx + 1))
             done
+            IFS="$_OIFS"
             echo ""
             msg_info "共 $CLIENT_COUNT 个客户端证书"
         fi
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1675,7 +1919,7 @@ SYSEOF
         fi
 
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1698,7 +1942,7 @@ SYSEOF
         echo "历史备份列表："
         ls -lh "$BACKUP_DIR"/*.tar.gz 2>/dev/null || echo "  无历史备份"
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1715,7 +1959,12 @@ SYSEOF
             for _bk in "$BACKUP_DIR"/*.tar.gz; do
                 [ ! -f "$_bk" ] && continue
                 _bk_count=$((_bk_count + 1))
-                _bk_list="$_bk_list $_bk"
+                if [ -z "$_bk_list" ]; then
+                    _bk_list="$_bk"
+                else
+                    _bk_list="$_bk_list
+$_bk"
+                fi
                 _bk_name=$(basename "$_bk")
                 _bk_size=$(du -h "$_bk" | awk '{print $1}')
                 printf "  %d) %s (%s)\n" "$_bk_count" "$_bk_name" "$_bk_size"
@@ -1724,24 +1973,25 @@ SYSEOF
 
         if [ "$_bk_count" -eq 0 ]; then
             msg_warn "无可用备份"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         echo ""
-        printf "选择要恢复的备份编号（q取消）： "; read _bk_sel
+        printf "选择要恢复的备份编号（q取消）： "; read -r _bk_sel
         [ "$_bk_sel" = "q" ] || [ "$_bk_sel" = "Q" ] && continue
 
         if ! echo "$_bk_sel" | grep -qE '^[0-9]+$' || [ "$_bk_sel" -lt 1 ] || [ "$_bk_sel" -gt "$_bk_count" ]; then
-            msg_err "无效选择"; printf "按回车继续..."; read dummy; continue
+            msg_err "无效选择"; printf "按回车继续..."; read -r dummy; continue
         fi
 
-        set -- $_bk_list
+        _OIFS="$IFS"; IFS='
+'; set -- $_bk_list; IFS="$_OIFS"
         _j=1
         while [ "$_j" -lt "$_bk_sel" ]; do shift; _j=$((_j + 1)); done
         RESTORE_FILE="$1"
 
         msg_warn "恢复将覆盖当前 /etc/openvpn 目录！"
-        printf "输入 YES 确认恢复： "; read _rc
+        printf "输入 YES 确认恢复： "; read -r _rc
         if [ "$_rc" = "YES" ]; then
             $SERVICE_STOP 2>/dev/null || true
             rm -rf /etc/openvpn/* 2>/dev/null || true
@@ -1753,7 +2003,7 @@ SYSEOF
                 msg_err "恢复失败"
             fi
         fi
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1765,11 +2015,11 @@ SYSEOF
 
         if [ ! -d "$EASYRSA_DIR" ] || [ ! -f "$CONFIG_FILE" ]; then
             msg_err "服务端未正确安装。"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         if ! select_client "选择要导出的客户端"; then
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
         CLIENT_NAME="$SELECTED_CLIENT"
 
@@ -1777,7 +2027,7 @@ SYSEOF
 
         if [ ! -f "pki/issued/${CLIENT_NAME}.crt" ] || [ ! -f "pki/private/${CLIENT_NAME}.key" ]; then
             msg_err "找不到 $CLIENT_NAME 的证书或私钥"
-            printf "按回车继续..."; read dummy; continue
+            printf "按回车继续..."; read -r dummy; continue
         fi
 
         PORT=$(grep '^port ' "$CONFIG_FILE" | awk '{print $2}'); PORT=${PORT:-443}
@@ -1786,7 +2036,7 @@ SYSEOF
         AUTH=$(grep '^auth ' "$CONFIG_FILE" | awk '{print $2}'); AUTH=${AUTH:-SHA512}
 
         SERVER_IP=$(get_public_ipv4 || echo "YOUR_SERVER_IP")
-        printf "服务器 IP（回车使用 %s）： " "$SERVER_IP"; read _ip
+        printf "服务器 IP（回车使用 %s）： " "$SERVER_IP"; read -r _ip
         SERVER_IP=${_ip:-$SERVER_IP}
 
         # 检测 tls-auth 还是 tls-crypt
@@ -1835,7 +2085,7 @@ EOF
         chmod 600 "$OVPN_FILE"
         audit "重新导出客户端: $CLIENT_NAME"
         msg_ok "已导出: $OVPN_FILE"
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1851,14 +2101,14 @@ EOF
             msg_info "已存在日志轮转配置："
             cat "$LOGROTATE_CONF"
             echo ""
-            printf "是否重新配置？(y/n，回车 n)： "; read _redo
-            [ "${_redo:-n}" != "y" ] && { printf "按回车返回..."; read dummy; continue; }
+            printf "是否重新配置？(y/n，回车 n)： "; read -r _redo
+            [ "${_redo:-n}" != "y" ] && { printf "按回车返回..."; read -r dummy; continue; }
         fi
 
-        printf "保留多少天的日志？（默认 14）： "; read _days
+        printf "保留多少天的日志？（默认 14）： "; read -r _days
         _days=${_days:-14}
 
-        printf "单个日志最大大小？（默认 50M）： "; read _size
+        printf "单个日志最大大小？（默认 50M）： "; read -r _size
         _size=${_size:-50M}
 
         cat > "$LOGROTATE_CONF" << EOF
@@ -1895,7 +2145,7 @@ EOF
         msg_info "服务日志: 每日轮转，保留 $_days 天，最大 $_size"
         msg_info "审计日志: 每月轮转，保留 12 个月"
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1908,7 +2158,7 @@ EOF
         INDEX_FILE="$EASYRSA_DIR/pki/index.txt"
         if [ ! -f "$INDEX_FILE" ]; then
             msg_warn "未找到证书索引文件"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         echo "状态说明: V=有效  R=已吊销  E=已过期"
@@ -1932,7 +2182,7 @@ EOF
         echo "------------------------------------------------------------"
         msg_info "有效: $_valid  已吊销: $_revoked"
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -1945,7 +2195,7 @@ EOF
         if [ ! -f "$STATUS_LOG" ]; then
             msg_warn "状态日志不存在: $STATUS_LOG"
             msg_info "请确保配置文件中包含: status $STATUS_LOG 10"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
         # 人类可读流量的辅助函数
@@ -2046,7 +2296,7 @@ EOF
         echo "------------------------------------------------------------"
 
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     # ─────────────────────────────────────────────────────────────
@@ -2058,10 +2308,10 @@ EOF
 
         if [ ! -f "$AUDIT_LOG" ]; then
             msg_warn "审计日志尚未生成"
-            printf "按回车返回菜单..."; read dummy; continue
+            printf "按回车返回菜单..."; read -r dummy; continue
         fi
 
-        printf "显示最近多少条？（默认 50）： "; read _n
+        printf "显示最近多少条？（默认 50）： "; read -r _n
         _n=${_n:-50}
 
         echo "------------------------------------------------------------"
@@ -2071,9 +2321,9 @@ EOF
         msg_info "共 $_total 条记录，显示最近 $_n 条"
 
         echo ""
-        printf "按回车返回主菜单..."; read dummy; continue
+        printf "按回车返回主菜单..."; read -r dummy; continue
     fi
 
     msg_warn "无效选项"
-    printf "按回车返回主菜单..."; read dummy
+    printf "按回车返回主菜单..."; read -r dummy
 done
