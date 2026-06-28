@@ -143,6 +143,26 @@ fw_persist_tun_lines() {
     fi
 }
 
+# 检查/尝试启用 TUN/TAP。OpenVPN 包安装成功不代表内核支持 tun。
+ensure_tun_available() {
+    [ -c /dev/net/tun ] && return 0
+
+    command -v modprobe >/dev/null 2>&1 && modprobe tun 2>/dev/null || true
+    if [ ! -c /dev/net/tun ]; then
+        mkdir -p /dev/net 2>/dev/null || true
+        mknod /dev/net/tun c 10 200 2>/dev/null || true
+        chmod 666 /dev/net/tun 2>/dev/null || true
+    fi
+
+    [ -c /dev/net/tun ] && return 0
+
+    msg_err "当前系统没有可用的 TUN/TAP 设备，OpenVPN 无法启动"
+    msg_info "这不是 OpenVPN 库缺失，而是内核/虚拟化环境未提供 tun"
+    msg_info "请确认 VPS/容器已开启 TUN/TAP；Docker/LXC 需要映射 /dev/net/tun 并授予 NET_ADMIN"
+    msg_info "可手动检查: ls -l /dev/net/tun"
+    return 1
+}
+
 # ─────────────────────────────────────────────────────────────
 # 获取客户端列表函数
 # ─────────────────────────────────────────────────────────────
@@ -237,9 +257,20 @@ if [ -f /etc/alpine-release ]; then
     SERVICE_RESTART="rc-service openvpn restart"
     SERVICE_ENABLE="rc-update add openvpn default"
     SERVICE_DISABLE="rc-update del openvpn default"
-    CONFIG_FILE="/etc/openvpn/openvpn.conf"
+    if [ -f /etc/openvpn/openvpn.conf ]; then
+        CONFIG_FILE="/etc/openvpn/openvpn.conf"
+    elif [ -f /etc/openvpn/server.conf ]; then
+        CONFIG_FILE="/etc/openvpn/server.conf"
+    elif [ -f /etc/openvpn/server/server.conf ]; then
+        CONFIG_FILE="/etc/openvpn/server/server.conf"
+    else
+        CONFIG_FILE="/etc/openvpn/openvpn.conf"
+    fi
     PERSIST_FILE="/etc/local.d/openvpn-persist.start"
-    EASYRSA_DIR="/etc/openvpn/easy-rsa"
+    case "$CONFIG_FILE" in
+        /etc/openvpn/server/*) EASYRSA_DIR="/etc/openvpn/server/easy-rsa" ;;
+        *) EASYRSA_DIR="/etc/openvpn/easy-rsa" ;;
+    esac
     USE_SYSTEMD=0
 elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
     OS="debian"
@@ -268,6 +299,10 @@ elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null;
         SVC_UNIT="openvpn@server"
         CONFIG_FILE="/etc/openvpn/server.conf"
         EASYRSA_DIR="/etc/openvpn/easy-rsa"
+    elif systemctl is-active openvpn@openvpn >/dev/null 2>&1; then
+        SVC_UNIT="openvpn@openvpn"
+        CONFIG_FILE="/etc/openvpn/openvpn.conf"
+        EASYRSA_DIR="/etc/openvpn/easy-rsa"
     fi
 
     # 检查2: 如果都没在运行，看哪个已启用
@@ -279,6 +314,10 @@ elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null;
         elif systemctl is-enabled openvpn@server >/dev/null 2>&1; then
             SVC_UNIT="openvpn@server"
             CONFIG_FILE="/etc/openvpn/server.conf"
+            EASYRSA_DIR="/etc/openvpn/easy-rsa"
+        elif systemctl is-enabled openvpn@openvpn >/dev/null 2>&1; then
+            SVC_UNIT="openvpn@openvpn"
+            CONFIG_FILE="/etc/openvpn/openvpn.conf"
             EASYRSA_DIR="/etc/openvpn/easy-rsa"
         fi
     fi
@@ -292,6 +331,11 @@ elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null;
                     SVC_UNIT="openvpn-server@server"
                     CONFIG_FILE="$_running_cfg"
                     EASYRSA_DIR="/etc/openvpn/server/easy-rsa"
+                    ;;
+                /etc/openvpn/openvpn.conf)
+                    SVC_UNIT="openvpn@openvpn"
+                    CONFIG_FILE="$_running_cfg"
+                    EASYRSA_DIR="/etc/openvpn/easy-rsa"
                     ;;
                 *)
                     SVC_UNIT="openvpn@server"
@@ -323,14 +367,18 @@ elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null;
 
     # 检查5: 最后兜底，看哪个配置文件实际存在
     if [ -z "$SVC_UNIT" ]; then
-        if [ -f /etc/openvpn/server.conf ]; then
-            SVC_UNIT="openvpn@server"
-            CONFIG_FILE="/etc/openvpn/server.conf"
-            EASYRSA_DIR="/etc/openvpn/easy-rsa"
-        elif [ -f /etc/openvpn/server/server.conf ]; then
+        if [ -f /etc/openvpn/server/server.conf ]; then
             SVC_UNIT="openvpn-server@server"
             CONFIG_FILE="/etc/openvpn/server/server.conf"
             EASYRSA_DIR="/etc/openvpn/server/easy-rsa"
+        elif [ -f /etc/openvpn/server.conf ]; then
+            SVC_UNIT="openvpn@server"
+            CONFIG_FILE="/etc/openvpn/server.conf"
+            EASYRSA_DIR="/etc/openvpn/easy-rsa"
+        elif [ -f /etc/openvpn/openvpn.conf ]; then
+            SVC_UNIT="openvpn@openvpn"
+            CONFIG_FILE="/etc/openvpn/openvpn.conf"
+            EASYRSA_DIR="/etc/openvpn/easy-rsa"
         else
             # 彻底兜底
             SVC_UNIT="openvpn@server"
@@ -449,6 +497,25 @@ detect_firewall() {
     fi
 }
 
+ensure_tun_available() {
+    [ -c /dev/net/tun ] && return 0
+
+    command -v modprobe >/dev/null 2>&1 && modprobe tun 2>/dev/null || true
+    if [ ! -c /dev/net/tun ]; then
+        mkdir -p /dev/net 2>/dev/null || true
+        mknod /dev/net/tun c 10 200 2>/dev/null || true
+        chmod 666 /dev/net/tun 2>/dev/null || true
+    fi
+
+    [ -c /dev/net/tun ] && return 0
+
+    msg_err "当前系统没有可用的 TUN/TAP 设备，OpenVPN 无法启动"
+    msg_info "依赖包已安装，但内核/虚拟化环境未提供 tun"
+    msg_info "VPS 面板请开启 TUN/TAP；Docker/LXC 需要映射 /dev/net/tun 并授予 NET_ADMIN"
+    msg_info "可手动检查: ls -l /dev/net/tun"
+    return 1
+}
+
 restore_policy_route() {
     _gw_state="/etc/openvpn/gateway-client.conf"
     [ ! -f "$_gw_state" ] && return 0
@@ -510,6 +577,8 @@ elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null;
     apt install -y openvpn easy-rsa iptables-persistent net-tools curl iproute2
     if [ -f payload/etc/openvpn/server/server.conf ]; then
         SVC_UNIT="openvpn-server@server"
+    elif [ -f payload/etc/openvpn/openvpn.conf ]; then
+        SVC_UNIT="openvpn@openvpn"
     else
         SVC_UNIT="openvpn@server"
     fi
@@ -548,6 +617,15 @@ fi
 rm -rf /etc/openvpn
 mkdir -p /etc
 tar cf - -C payload etc/openvpn | tar xf - -C /
+if [ "$OS" = "alpine" ] && [ ! -f /etc/openvpn/openvpn.conf ]; then
+    if [ -f /etc/openvpn/server.conf ]; then
+        ln -sf /etc/openvpn/server.conf /etc/openvpn/openvpn.conf
+        CONFIG_FILE="/etc/openvpn/openvpn.conf"
+    elif [ -f /etc/openvpn/server/server.conf ]; then
+        ln -sf /etc/openvpn/server/server.conf /etc/openvpn/openvpn.conf
+        CONFIG_FILE="/etc/openvpn/openvpn.conf"
+    fi
+fi
 chmod 700 /etc/openvpn/easy-rsa/pki/private 2>/dev/null || true
 find /etc/openvpn -name '*.key' -exec chmod 600 {} \; 2>/dev/null || true
 
@@ -627,7 +705,11 @@ esac
 
 restore_policy_route
 $SERVICE_ENABLE 2>/dev/null || true
-$SERVICE_RESTART 2>/dev/null || true
+if ensure_tun_available; then
+    $SERVICE_RESTART 2>/dev/null || true
+else
+    msg_warn "已完成文件恢复，但因 TUN/TAP 不可用，暂未启动 OpenVPN"
+fi
 
 msg_ok "恢复完成"
 msg_info "新服务器 IP: $NEW_SERVER_IP"
@@ -1884,6 +1966,10 @@ GWEOF
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "8" ]; then
         msg_info "正在重启 OpenVPN 服务..."
+        if ! ensure_tun_available; then
+            audit "重启服务: 失败(TUN不可用)"
+            printf "按回车返回主菜单..."; read -r dummy; continue
+        fi
         if $SERVICE_RESTART 2>&1; then
             sleep 2
             # 二次确认: 检查服务是否真正在运行
