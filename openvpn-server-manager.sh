@@ -361,6 +361,7 @@ create_migration_backup() {
     BACKUP_FILE="$BACKUP_DIR/openvpn-migrate-${_ts}.tar.gz"
     _work="${BACKUP_DIR}/.openvpn-migrate-${_ts}.$$"
     _payload="$_work/payload"
+    _self_path="$0"
 
     if [ ! -d /etc/openvpn ]; then
         msg_err "未找到 /etc/openvpn，无法备份"
@@ -372,6 +373,15 @@ create_migration_backup() {
         rm -rf "$_work"
         msg_err "复制 OpenVPN 配置失败"
         return 1
+    fi
+
+    if [ -f "$_self_path" ]; then
+        mkdir -p "$_payload/usr/local/bin" "$_payload/root"
+        cp "$_self_path" "$_payload/usr/local/bin/openvpn-server-manager.sh" 2>/dev/null || true
+        cp "$_self_path" "$_payload/root/openvpn-server-manager.sh" 2>/dev/null || true
+        chmod +x "$_payload/usr/local/bin/openvpn-server-manager.sh" "$_payload/root/openvpn-server-manager.sh" 2>/dev/null || true
+    else
+        msg_warn "未找到当前管理脚本路径: $_self_path，备份包将不包含 openvpn-server-manager.sh"
     fi
 
     _port=$(grep '^port ' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}'); _port=${_port:-443}
@@ -398,8 +408,8 @@ OpenVPN 迁移备份包
 3. 进入目录：cd openvpn-restore
 4. 执行恢复：sh restore-openvpn.sh
 
-恢复脚本会安装依赖、覆盖 /etc/openvpn、更新客户端 .ovpn 中的 remote IP、
-开启 IP 转发、放行 OpenVPN 端口并重启服务。
+恢复脚本会安装依赖、覆盖 /etc/openvpn、恢复 openvpn-server-manager.sh、
+更新客户端 .ovpn 中的 remote IP、开启 IP 转发、放行 OpenVPN 端口并重启服务。
 EOF
 
     cat > "$_work/restore-openvpn.sh" << 'RESTOREEOF'
@@ -541,6 +551,22 @@ tar cf - -C payload etc/openvpn | tar xf - -C /
 chmod 700 /etc/openvpn/easy-rsa/pki/private 2>/dev/null || true
 find /etc/openvpn -name '*.key' -exec chmod 600 {} \; 2>/dev/null || true
 
+if [ -f payload/usr/local/bin/openvpn-server-manager.sh ]; then
+    mkdir -p /usr/local/bin /root
+    cp payload/usr/local/bin/openvpn-server-manager.sh /usr/local/bin/openvpn-server-manager.sh
+    cp payload/usr/local/bin/openvpn-server-manager.sh /root/openvpn-server-manager.sh 2>/dev/null || true
+    chmod +x /usr/local/bin/openvpn-server-manager.sh /root/openvpn-server-manager.sh 2>/dev/null || true
+    msg_ok "已恢复管理脚本: /usr/local/bin/openvpn-server-manager.sh"
+elif [ -f payload/root/openvpn-server-manager.sh ]; then
+    mkdir -p /usr/local/bin /root
+    cp payload/root/openvpn-server-manager.sh /usr/local/bin/openvpn-server-manager.sh
+    cp payload/root/openvpn-server-manager.sh /root/openvpn-server-manager.sh 2>/dev/null || true
+    chmod +x /usr/local/bin/openvpn-server-manager.sh /root/openvpn-server-manager.sh 2>/dev/null || true
+    msg_ok "已恢复管理脚本: /usr/local/bin/openvpn-server-manager.sh"
+else
+    msg_warn "备份包中未包含 openvpn-server-manager.sh"
+fi
+
 if [ -f "$CONFIG_FILE" ] && grep -q '^local ' "$CONFIG_FILE" 2>/dev/null; then
     sed_inplace "s/^local .*/local $NEW_SERVER_IP/" "$CONFIG_FILE"
 fi
@@ -607,6 +633,7 @@ msg_ok "恢复完成"
 msg_info "新服务器 IP: $NEW_SERVER_IP"
 msg_info "OpenVPN: $PROTO/$PORT"
 msg_info "客户端配置已更新: /etc/openvpn/client-*.ovpn"
+msg_info "管理脚本: /usr/local/bin/openvpn-server-manager.sh"
 RESTOREEOF
     chmod +x "$_work/restore-openvpn.sh"
 
