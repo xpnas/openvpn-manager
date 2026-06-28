@@ -48,6 +48,14 @@ audit() {
     printf '[%s] user=%s action="%s"\n' "$_ts" "$_user" "$*" >> "$AUDIT_LOG" 2>/dev/null || true
 }
 
+# POSIX 兼容的 sed -i 替代函数
+sed_inplace() {
+    _sed_expr="$1"
+    _sed_file="$2"
+    _sed_tmp="${_sed_file}.sedtmp.$$"
+    sed "$_sed_expr" "$_sed_file" > "$_sed_tmp" && mv "$_sed_tmp" "$_sed_file"
+}
+
 # 
 # Root 权限检查
 # 
@@ -183,6 +191,57 @@ select_profile() {
     _j=1
     while [ "$_j" -lt "$_sel" ]; do shift; _j=$((_j + 1)); done
     SELECTED_PROFILE="$1"
+    return 0
+}
+
+# 更新 .ovpn 配置中的 remote 服务器地址，保留原端口和协议
+update_remote_in_file() {
+    _new_ip="$1"
+    _file="$2"
+    [ -f "$_file" ] || return 1
+    if grep -qi '^remote[[:space:]]' "$_file" 2>/dev/null; then
+        sed_inplace "s/^[Rr][Ee][Mm][Oo][Tt][Ee][[:space:]][^[:space:]]*/remote $_new_ip/" "$_file"
+        return 0
+    fi
+    return 1
+}
+
+update_server_ip_for_configs() {
+    _new_ip="$1"
+    _scope="${2:-all}"
+    _updated=0
+
+    if ! echo "$_new_ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+        msg_err "请输入有效 IPv4 地址"
+        return 1
+    fi
+
+    case "$_scope" in
+        current)
+            if update_remote_in_file "$_new_ip" "$CONFIG_FILE"; then
+                _updated=$((_updated + 1))
+            fi
+            ;;
+        all|*)
+            if update_remote_in_file "$_new_ip" "$CONFIG_FILE"; then
+                _updated=$((_updated + 1))
+            fi
+            for _p in "$PROFILES_DIR"/*.ovpn; do
+                [ -f "$_p" ] || continue
+                if update_remote_in_file "$_new_ip" "$_p"; then
+                    _updated=$((_updated + 1))
+                fi
+            done
+            ;;
+    esac
+
+    if [ "$_updated" -eq 0 ]; then
+        msg_warn "未找到可更新的 remote 行"
+        return 1
+    fi
+
+    audit "更新服务器IP: $_new_ip scope=$_scope updated=$_updated"
+    msg_ok "已更新 $_updated 个配置文件的服务器 IP 为 $_new_ip"
     return 0
 }
 
@@ -339,6 +398,13 @@ if [ $# -gt 0 ]; then
             ;;
         --dns-check)
             check_dns_leak; exit $? ;;
+        --update-server-ip)
+            NEW_SERVER_IP="$2"
+            SCOPE="${3:-all}"
+            [ -z "$NEW_SERVER_IP" ] && { msg_err "用法: $0 --update-server-ip NEW_IP [all|current]"; exit 1; }
+            update_server_ip_for_configs "$NEW_SERVER_IP" "$SCOPE"
+            exit $?
+            ;;
         --help|-h)
             echo "用法: $0 [选项]"
             echo ""
@@ -350,6 +416,7 @@ if [ $# -gt 0 ]; then
             echo "  --import FILE [name]        导入 .ovpn 文件"
             echo "  --list                      列出所有配置文件"
             echo "  --dns-check                 DNS 泄漏检测"
+            echo "  --update-server-ip IP [all|current] 更新 .ovpn 服务器 IP"
             echo "  --help                      显示帮助"
             echo ""
             echo "不带参数则进入交互式菜单。"
@@ -398,9 +465,10 @@ while true; do
     echo " ${CYAN}11)${RESET} DNS 泄漏检测"
     echo " ${CYAN}12)${RESET} 自动重连守护"
     echo " ${CYAN}13)${RESET} 查看审计日志"
+    echo " ${CYAN}14)${RESET} 更新新服务器 IP"
     echo " ${RED} 0)${RESET} 退出脚本"
     echo ""
-    printf "请选择操作（0~13，回车默认3）： "
+    printf "请选择操作（0~14，回车默认3）： "
     read -r mode_choice
     MODE=${mode_choice:-3}
 
@@ -924,6 +992,52 @@ LREOF
         echo "------------------------------------------------------------"
         _total=$(wc -l < "$AUDIT_LOG")
         msg_info "共 $_total 条记录，显示最近 $_n 条"
+
+        printf "按回车返回主菜单..."; read -r dummy; continue
+    fi
+
+    # ─
+    # 模式14：服务端迁移后更新新服务器 IP
+    # ─
+    if [ "$MODE" = "14" ]; then
+        echo "${BOLD}=== 更新新服务器 IP ===${RESET}"
+        echo ""
+
+        if [ -f "$CONFIG_FILE" ]; then
+            _cur_remote=$(grep -i '^remote ' "$CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $2":"$3}')
+            [ -n "$_cur_remote" ] && msg_info "当前活动配置 remote: $_cur_remote"
+        fi
+
+        printf "请输入新服务器公网 IP： "; read -r NEW_SERVER_IP
+        if [ -z "$NEW_SERVER_IP" ]; then
+            msg_warn "已取消"
+            printf "按回车返回主菜单..."; read -r dummy; continue
+        fi
+
+        echo ""
+        echo "更新范围："
+        echo "  1) 所有配置文件 + 当前活动配置（推荐）"
+        echo "  2) 仅当前活动配置"
+        printf "选择（回车 1）： "; read -r _scope_choice
+        case "${_scope_choice:-1}" in
+            2) _scope="current" ;;
+            *) _scope="all" ;;
+        esac
+
+        if update_server_ip_for_configs "$NEW_SERVER_IP" "$_scope"; then
+            if check_vpn_connected; then
+                echo ""
+                printf "VPN 当前已连接，是否立即重连以应用新 IP？(y/n，回车 y)： "; read -r _reconn
+                if [ "${_reconn:-y}" = "y" ]; then
+                    $SERVICE_STOP 2>/dev/null || true
+                    sleep 1
+                    $SERVICE_START >/dev/null 2>&1 || true
+                    msg_info "已发起重连，请稍后查看连接状态"
+                fi
+            else
+                msg_info "下次连接 VPN 时将使用新服务器 IP"
+            fi
+        fi
 
         printf "按回车返回主菜单..."; read -r dummy; continue
     fi

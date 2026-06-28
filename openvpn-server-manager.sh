@@ -352,6 +352,272 @@ fi
 CCD_DIR="/etc/openvpn/ccd"
 BACKUP_DIR="/root/openvpn-backups"
 
+# ─────────────────────────────────────────────────────────────
+# 创建可迁移备份包（包含 /etc/openvpn、元信息、内置恢复脚本）
+# ─────────────────────────────────────────────────────────────
+create_migration_backup() {
+    mkdir -p "$BACKUP_DIR"
+    _ts=$(date +%Y%m%d-%H%M%S)
+    BACKUP_FILE="$BACKUP_DIR/openvpn-migrate-${_ts}.tar.gz"
+    _work="${BACKUP_DIR}/.openvpn-migrate-${_ts}.$$"
+    _payload="$_work/payload"
+
+    if [ ! -d /etc/openvpn ]; then
+        msg_err "未找到 /etc/openvpn，无法备份"
+        return 1
+    fi
+
+    mkdir -p "$_payload" "$_work"
+    if ! tar cf - -C / etc/openvpn 2>/dev/null | tar xf - -C "$_payload" 2>/dev/null; then
+        rm -rf "$_work"
+        msg_err "复制 OpenVPN 配置失败"
+        return 1
+    fi
+
+    _port=$(grep '^port ' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}'); _port=${_port:-443}
+    _proto=$(grep '^proto ' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}'); _proto=${_proto:-tcp}
+    _public_ip=$(get_public_ipv4 2>/dev/null || echo "unknown")
+
+    cat > "$_work/manifest.env" << EOF
+BACKUP_CREATED=$_ts
+SOURCE_OS=$OS
+SOURCE_SERVICE=${SVC_UNIT:-openvpn}
+SOURCE_CONFIG_FILE=$CONFIG_FILE
+SOURCE_EASYRSA_DIR=$EASYRSA_DIR
+SOURCE_PUBLIC_IP=$_public_ip
+OPENVPN_PORT=$_port
+OPENVPN_PROTO=$_proto
+EOF
+
+    cat > "$_work/README.txt" << EOF
+OpenVPN 迁移备份包
+
+恢复步骤：
+1. 将本压缩包复制到新服务器。
+2. 新建目录并解压：mkdir openvpn-restore && tar xzf $(basename "$BACKUP_FILE") -C openvpn-restore
+3. 进入目录：cd openvpn-restore
+4. 执行恢复：sh restore-openvpn.sh
+
+恢复脚本会安装依赖、覆盖 /etc/openvpn、更新客户端 .ovpn 中的 remote IP、
+开启 IP 转发、放行 OpenVPN 端口并重启服务。
+EOF
+
+    cat > "$_work/restore-openvpn.sh" << 'RESTOREEOF'
+#!/bin/sh
+set -u
+
+msg_ok()   { printf "[✓] %s\n" "$1"; }
+msg_err()  { printf "[✗] %s\n" "$1"; }
+msg_warn() { printf "[!] %s\n" "$1"; }
+msg_info() { printf "[i] %s\n" "$1"; }
+
+sed_inplace() {
+    _expr="$1"
+    _file="$2"
+    _tmp="${_file}.tmp.$$"
+    sed "$_expr" "$_file" > "$_tmp" && mv "$_tmp" "$_file"
+}
+
+get_public_ipv4() {
+    _ip=""
+    for _url in ifconfig.me icanhazip.com api.ipify.org ip.sb ipinfo.io/ip; do
+        _ip=$(curl -4 -s --max-time 5 "$_url" 2>/dev/null)
+        if echo "$_ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            echo "$_ip"; return 0
+        fi
+    done
+    ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1
+}
+
+detect_firewall() {
+    if command -v iptables >/dev/null 2>&1 && iptables -L >/dev/null 2>&1; then
+        echo "iptables"
+    elif command -v nft >/dev/null 2>&1; then
+        echo "nftables"
+    else
+        echo "none"
+    fi
+}
+
+restore_policy_route() {
+    _gw_state="/etc/openvpn/gateway-client.conf"
+    [ ! -f "$_gw_state" ] && return 0
+    _gw_ip=$(grep '^GATEWAY_IP=' "$_gw_state" | cut -d= -f2)
+    _srv_net=$(grep '^VPN_NET=' "$_gw_state" | cut -d= -f2)
+    _srv_cidr=$(grep '^VPN_CIDR=' "$_gw_state" | cut -d= -f2)
+    [ -z "$_gw_ip" ] || [ -z "$_srv_net" ] || [ -z "$_srv_cidr" ] && return 0
+
+    grep -q "^100 vpntunnel" /etc/iproute2/rt_tables 2>/dev/null || echo "100 vpntunnel" >> /etc/iproute2/rt_tables
+    ip rule add from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true
+    ip rule add from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true
+    if ip link show tun0 >/dev/null 2>&1; then
+        ip route replace default via "$_gw_ip" dev tun0 table 100 2>/dev/null || true
+    fi
+
+    if [ "$OS" = "alpine" ]; then
+        mkdir -p /etc/local.d
+        cat > /etc/local.d/openvpn-policy-route.start << EOF
+#!/bin/sh
+sleep 3
+ip rule add from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true
+ip rule add from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true
+ip route replace default via $_gw_ip dev tun0 table 100 2>/dev/null || true
+EOF
+        cat > /etc/local.d/openvpn-policy-route.stop << EOF
+#!/bin/sh
+ip route flush table 100 2>/dev/null || true
+ip rule del from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true
+ip rule del from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true
+EOF
+        chmod +x /etc/local.d/openvpn-policy-route.start /etc/local.d/openvpn-policy-route.stop
+    elif [ -n "${SVC_UNIT:-}" ]; then
+        mkdir -p "/etc/systemd/system/${SVC_UNIT}.service.d"
+        cat > "/etc/systemd/system/${SVC_UNIT}.service.d/policy-route.conf" << EOF
+[Service]
+ExecStartPost=-/bin/sh -c 'sleep 2; ip rule add from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true; ip rule add from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true; ip route replace default via $_gw_ip dev tun0 table 100 || true'
+ExecStopPost=-/bin/sh -c 'ip route flush table 100 || true; ip rule del from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true; ip rule del from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true'
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+[ "$(id -u)" -eq 0 ] || { msg_err "请以 root 用户运行恢复脚本"; exit 1; }
+[ -d payload/etc/openvpn ] || { msg_err "未找到 payload/etc/openvpn，请在解压目录内执行"; exit 1; }
+[ -f manifest.env ] && . ./manifest.env
+
+if [ -f /etc/alpine-release ]; then
+    OS="alpine"
+    apk add --no-cache openvpn easy-rsa iptables openssl ca-certificates curl iproute2 2>/dev/null || true
+    SVC_UNIT="openvpn"
+    SERVICE_STOP="rc-service openvpn stop"
+    SERVICE_RESTART="rc-service openvpn restart"
+    SERVICE_ENABLE="rc-update add openvpn default"
+elif [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
+    OS="debian"
+    apt update
+    apt install -y openvpn easy-rsa iptables-persistent net-tools curl iproute2
+    if [ -f payload/etc/openvpn/server/server.conf ]; then
+        SVC_UNIT="openvpn-server@server"
+    else
+        SVC_UNIT="openvpn@server"
+    fi
+    SERVICE_STOP="systemctl stop $SVC_UNIT"
+    SERVICE_RESTART="systemctl restart $SVC_UNIT"
+    SERVICE_ENABLE="systemctl enable $SVC_UNIT"
+else
+    msg_err "不支持的系统，仅支持 Alpine 或 Debian/Ubuntu"
+    exit 1
+fi
+
+CONFIG_FILE="/etc/openvpn/server.conf"
+[ -f payload/etc/openvpn/openvpn.conf ] && CONFIG_FILE="/etc/openvpn/openvpn.conf"
+[ -f payload/etc/openvpn/server/server.conf ] && CONFIG_FILE="/etc/openvpn/server/server.conf"
+
+_auto_ip=$(get_public_ipv4)
+printf "新服务器公网 IP（回车使用 %s）： " "${_auto_ip:-自动检测失败}"
+read -r NEW_SERVER_IP
+NEW_SERVER_IP=${NEW_SERVER_IP:-$_auto_ip}
+if ! echo "$NEW_SERVER_IP" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+    msg_err "未获得有效 IPv4，已停止恢复"
+    exit 1
+fi
+
+msg_warn "即将覆盖 /etc/openvpn。"
+printf "输入 YES 确认恢复： "
+read -r _confirm
+[ "$_confirm" = "YES" ] || { msg_warn "已取消"; exit 0; }
+
+$SERVICE_STOP 2>/dev/null || true
+mkdir -p /root/openvpn-backups
+if [ -d /etc/openvpn ]; then
+    tar czf "/root/openvpn-backups/before-restore-$(date +%Y%m%d-%H%M%S).tar.gz" -C / etc/openvpn 2>/dev/null || true
+fi
+
+rm -rf /etc/openvpn
+mkdir -p /etc
+tar cf - -C payload etc/openvpn | tar xf - -C /
+chmod 700 /etc/openvpn/easy-rsa/pki/private 2>/dev/null || true
+find /etc/openvpn -name '*.key' -exec chmod 600 {} \; 2>/dev/null || true
+
+if [ -f "$CONFIG_FILE" ] && grep -q '^local ' "$CONFIG_FILE" 2>/dev/null; then
+    sed_inplace "s/^local .*/local $NEW_SERVER_IP/" "$CONFIG_FILE"
+fi
+
+PORT=$(grep '^port ' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}'); PORT=${PORT:-${OPENVPN_PORT:-443}}
+PROTO=$(grep '^proto ' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}'); PROTO=${PROTO:-${OPENVPN_PROTO:-tcp}}
+
+for _ovpn in /etc/openvpn/client-*.ovpn; do
+    [ -f "$_ovpn" ] || continue
+    if grep -q '^remote ' "$_ovpn" 2>/dev/null; then
+        sed_inplace "s/^remote .*/remote $NEW_SERVER_IP $PORT/" "$_ovpn"
+    fi
+done
+
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+_fw=$(detect_firewall)
+case "$_fw" in
+    iptables)
+        iptables -I INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null || true
+        iptables -I FORWARD -i tun0 -o tun0 -j ACCEPT 2>/dev/null || true
+        if [ "$OS" = "debian" ]; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        else
+            mkdir -p /etc/local.d
+            cat > /etc/local.d/openvpn-persist.start << EOF
+#!/bin/sh
+iptables -I INPUT -p $PROTO --dport $PORT -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -i tun0 -o tun0 -j ACCEPT 2>/dev/null || true
+EOF
+            chmod +x /etc/local.d/openvpn-persist.start
+        fi
+        ;;
+    nftables)
+        nft add table inet filter 2>/dev/null || true
+        nft add chain inet filter input '{ type filter hook input priority filter; policy accept; }' 2>/dev/null || true
+        nft add chain inet filter forward '{ type filter hook forward priority filter; policy accept; }' 2>/dev/null || true
+        nft add rule inet filter input "$PROTO" dport "$PORT" accept 2>/dev/null || true
+        nft add rule inet filter forward iifname "tun0" oifname "tun0" accept 2>/dev/null || true
+        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+        systemctl enable nftables 2>/dev/null || true
+        if [ "$OS" = "alpine" ]; then
+            mkdir -p /etc/local.d
+            cat > /etc/local.d/openvpn-persist.start << EOF
+#!/bin/sh
+nft add table inet filter 2>/dev/null || true
+nft add chain inet filter input '{ type filter hook input priority filter; policy accept; }' 2>/dev/null || true
+nft add chain inet filter forward '{ type filter hook forward priority filter; policy accept; }' 2>/dev/null || true
+nft add rule inet filter input $PROTO dport $PORT accept 2>/dev/null || true
+nft add rule inet filter forward iifname tun0 oifname tun0 accept 2>/dev/null || true
+EOF
+            chmod +x /etc/local.d/openvpn-persist.start
+        fi
+        ;;
+esac
+
+restore_policy_route
+$SERVICE_ENABLE 2>/dev/null || true
+$SERVICE_RESTART 2>/dev/null || true
+
+msg_ok "恢复完成"
+msg_info "新服务器 IP: $NEW_SERVER_IP"
+msg_info "OpenVPN: $PROTO/$PORT"
+msg_info "客户端配置已更新: /etc/openvpn/client-*.ovpn"
+RESTOREEOF
+    chmod +x "$_work/restore-openvpn.sh"
+
+    if tar czf "$BACKUP_FILE" -C "$_work" . 2>/dev/null; then
+        rm -rf "$_work"
+        return 0
+    fi
+
+    rm -rf "$_work"
+    msg_err "生成压缩包失败"
+    return 1
+}
+
 # 自动检测 status log 路径
 STATUS_LOG=""
 # 优先从配置文件中读取 status 指令
@@ -600,12 +866,32 @@ EOF
             exit 0
             ;;
         --backup)
-            mkdir -p "$BACKUP_DIR"
-            _bk="$BACKUP_DIR/openvpn-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-            tar czf "$_bk" -C / etc/openvpn 2>/dev/null
-            audit "非交互备份: $_bk"
-            msg_ok "备份完成: $_bk"
-            exit 0
+            if create_migration_backup; then
+                audit "非交互迁移备份: $BACKUP_FILE"
+                _size=$(du -h "$BACKUP_FILE" | awk '{print $1}')
+                msg_ok "迁移备份完成: $BACKUP_FILE (${_size})"
+                msg_info "复制到新服务器后执行: mkdir openvpn-restore && tar xzf $(basename "$BACKUP_FILE") -C openvpn-restore && cd openvpn-restore && sh restore-openvpn.sh"
+                exit 0
+            fi
+            exit 1
+            ;;
+        --restore)
+            RESTORE_FILE="$2"
+            [ -z "$RESTORE_FILE" ] && { msg_err "用法: $0 --restore BACKUP.tar.gz"; exit 1; }
+            [ -f "$RESTORE_FILE" ] || { msg_err "备份文件不存在: $RESTORE_FILE"; exit 1; }
+            _restore_tmp="/tmp/openvpn-restore-$$"
+            rm -rf "$_restore_tmp"
+            mkdir -p "$_restore_tmp"
+            if tar xzf "$RESTORE_FILE" -C "$_restore_tmp" 2>/dev/null && [ -f "$_restore_tmp/restore-openvpn.sh" ]; then
+                cd "$_restore_tmp"
+                sh ./restore-openvpn.sh
+                _rc=$?
+                rm -rf "$_restore_tmp"
+                exit "$_rc"
+            fi
+            rm -rf "$_restore_tmp"
+            msg_err "不是新的迁移备份包，旧格式请用交互菜单恢复"
+            exit 1
             ;;
         --export-client)
             CLIENT_NAME="$2"
@@ -632,7 +918,8 @@ EOF
             echo "  --list-clients                                 列出所有客户端"
             echo "  --export-client NAME                           导出客户端 .ovpn 到 stdout"
             echo "  --status                                       查看服务状态"
-            echo "  --backup                                       备份配置"
+            echo "  --backup                                       生成可迁移备份包"
+            echo "  --restore BACKUP.tar.gz                        恢复可迁移备份包"
             echo "  --restart                                      重启服务"
             echo "  --stop                                         停止服务"
             echo "  --help                                         显示帮助"
@@ -677,8 +964,8 @@ while true; do
         echo " ${GREEN}11)${RESET} 关闭开机启动 OpenVPN 服务"
         echo " ${CYAN}12)${RESET} 查看所有客户端列表"
         echo " ${CYAN}13)${RESET} 查看服务运行状态 / 在线客户端"
-        echo " ${CYAN}14)${RESET} 备份配置"
-        echo " ${CYAN}15)${RESET} 恢复配置"
+        echo " ${CYAN}14)${RESET} 生成迁移备份包"
+        echo " ${CYAN}15)${RESET} 恢复备份包"
         echo " ${CYAN}16)${RESET} 重新导出客户端 .ovpn"
         echo " ${CYAN}17)${RESET} 配置日志轮转"
         echo " ${CYAN}18)${RESET} 查看吊销证书列表"
@@ -1923,17 +2210,19 @@ GWEOF
     fi
 
     # ─────────────────────────────────────────────────────────────
-    # 模式14：备份配置
+    # 模式14：生成迁移备份包
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "14" ]; then
-        echo "${BOLD}=== 备份配置 ===${RESET}"
-        mkdir -p "$BACKUP_DIR"
-        BACKUP_FILE="$BACKUP_DIR/openvpn-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-        tar czf "$BACKUP_FILE" -C / etc/openvpn 2>/dev/null
-        if [ $? -eq 0 ]; then
+        echo "${BOLD}=== 生成迁移备份包 ===${RESET}"
+        if create_migration_backup; then
             _size=$(du -h "$BACKUP_FILE" | awk '{print $1}')
-            audit "备份配置: $BACKUP_FILE"
-            msg_ok "备份完成: $BACKUP_FILE (${_size})"
+            audit "生成迁移备份包: $BACKUP_FILE"
+            msg_ok "迁移备份完成: $BACKUP_FILE (${_size})"
+            msg_info "将该压缩包复制到新服务器后执行："
+            echo "  mkdir openvpn-restore"
+            echo "  tar xzf $(basename "$BACKUP_FILE") -C openvpn-restore"
+            echo "  cd openvpn-restore"
+            echo "  sh restore-openvpn.sh"
         else
             msg_err "备份失败"
         fi
@@ -1946,10 +2235,10 @@ GWEOF
     fi
 
     # ─────────────────────────────────────────────────────────────
-    # 模式15：恢复配置
+    # 模式15：恢复备份包
     # ─────────────────────────────────────────────────────────────
     if [ "$MODE" = "15" ]; then
-        echo "${BOLD}=== 恢复配置 ===${RESET}"
+        echo "${BOLD}=== 恢复备份包 ===${RESET}"
         echo ""
         echo "可用备份文件："
 
@@ -1990,17 +2279,31 @@ $_bk"
         while [ "$_j" -lt "$_bk_sel" ]; do shift; _j=$((_j + 1)); done
         RESTORE_FILE="$1"
 
-        msg_warn "恢复将覆盖当前 /etc/openvpn 目录！"
-        printf "输入 YES 确认恢复： "; read -r _rc
-        if [ "$_rc" = "YES" ]; then
-            $SERVICE_STOP 2>/dev/null || true
-            rm -rf /etc/openvpn/* 2>/dev/null || true
-            tar xzf "$RESTORE_FILE" -C / 2>/dev/null
-            if [ $? -eq 0 ]; then
-                audit "恢复配置: $RESTORE_FILE"
-                msg_ok "恢复完成，建议重启服务"
-            else
-                msg_err "恢复失败"
+        _restore_tmp="/tmp/openvpn-restore-$$"
+        rm -rf "$_restore_tmp"
+        mkdir -p "$_restore_tmp"
+        if tar xzf "$RESTORE_FILE" -C "$_restore_tmp" 2>/dev/null && [ -f "$_restore_tmp/restore-openvpn.sh" ]; then
+            msg_info "检测到新格式迁移备份包，将执行内置恢复脚本。"
+            (cd "$_restore_tmp" && sh ./restore-openvpn.sh)
+            _restore_rc=$?
+            rm -rf "$_restore_tmp"
+            if [ "$_restore_rc" -eq 0 ]; then
+                audit "恢复迁移备份包: $RESTORE_FILE"
+            fi
+        else
+            rm -rf "$_restore_tmp"
+            msg_warn "检测到旧格式备份，恢复将覆盖当前 /etc/openvpn 目录！"
+            printf "输入 YES 确认恢复： "; read -r _rc
+            if [ "$_rc" = "YES" ]; then
+                $SERVICE_STOP 2>/dev/null || true
+                rm -rf /etc/openvpn/* 2>/dev/null || true
+                tar xzf "$RESTORE_FILE" -C / 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    audit "恢复旧格式备份: $RESTORE_FILE"
+                    msg_ok "恢复完成，建议重启服务"
+                else
+                    msg_err "恢复失败"
+                fi
             fi
         fi
         printf "按回车返回主菜单..."; read -r dummy; continue
