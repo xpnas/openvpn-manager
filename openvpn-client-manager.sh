@@ -1,4 +1,4 @@
-﻿#!/bin/sh
+#!/bin/sh
 # 
 # OpenVPN 客户端管理脚本 v2.0 - 兼容 Alpine & Debian/Ubuntu
 # 功能增强版：
