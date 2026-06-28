@@ -447,6 +447,8 @@ restore_policy_route() {
     _srv_cidr=$(grep '^VPN_CIDR=' "$_gw_state" | cut -d= -f2)
     [ -z "$_gw_ip" ] || [ -z "$_srv_net" ] || [ -z "$_srv_cidr" ] && return 0
 
+    mkdir -p /etc/iproute2
+    touch /etc/iproute2/rt_tables 2>/dev/null || true
     grep -q "^100 vpntunnel" /etc/iproute2/rt_tables 2>/dev/null || echo "100 vpntunnel" >> /etc/iproute2/rt_tables
     ip rule add from ${_gw_ip}/32 lookup main priority 99 2>/dev/null || true
     ip rule add from ${_srv_net}/${_srv_cidr} lookup 100 priority 100 2>/dev/null || true
